@@ -153,7 +153,7 @@ class FNSNeuron(GradNeuDyn):
         keep_size: bool = False,
         mode: Optional[bm.Mode] = None,
         name: Optional[str] = None,
-        spk_fun: Callable = bm.surrogate.InvSquareGrad(),
+        spk_fun: Callable = bm.surrogate.InvSquareGrad(), # Surrogate spiking function. 
         spk_dtype: Any = None,
         spk_reset: str = "hard",
         detach_spk: bool = False,

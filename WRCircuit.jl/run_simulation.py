@@ -1,9 +1,10 @@
-# Helper routines to independently run the simulation outside of notebook environments.
+# Script to independantly run the spatial simulation outsidoe of a notebook environment.
 
 import brainpy as bp # Used to define neuron models.
 import jax # Only used for the random number generator key, here.
-import matplotlib.pyplot as plt
 import numpy as np
+
+import matplotlib.pyplot as plt
 from matplotlib.widgets import Button, Slider
 
 from src.models.Spatial import Spatial # Spatial neural network model.
@@ -11,7 +12,7 @@ from src.plots import animate_spiking_activity # Animates the spatial neural net
 
 
 
-MODE = "interactive"  # "interactive", "save", or "both"
+
 OUTPUT = "spiking_animation.gif" # Filename to save with.
 
 FPS = 30.0 # [frames/s]
@@ -20,7 +21,7 @@ PLAYBACK_SPEED = 1 # Playback scaling. 1.0 = Real time.
 WINDOW_SIZE_MS = 10.0 # [ms] Integration window for visualisation.
 DURATION_MS = 2000.0 # [ms] Total simulation duration. 
 
-SEED = 42
+SEED = 42 # Seed for the random number generator.
 RHO = 10000 # [neurons / mm^2] Density of excitatory neurons.
 DX = 1 # [mm] Side length of spatial domain. 
 
@@ -28,15 +29,12 @@ DX = 1 # [mm] Side length of spatial domain.
 
 
 
-def prepare_spike_histograms(
-    FNSnet,
-    runner,
-    window_size_ms,
-    frame_step_ms,
-):
-    """Precompute spike-count histograms for each animation frame."""
-    ts = np.asarray(runner.mon["ts"])
-    E_spikes = np.asarray(runner.mon["E.spike"])
+def prepare_spike_histograms(FNSnet, runner, window_size_ms, frame_step_ms):
+
+    # Function to precompute spike-count histograms for each animation frame.
+
+    ts = np.asarray(runner.mon["ts"]) # Rectrieve simulation timestamps.
+    E_spikes = np.asarray(runner.mon["E.spike"]) # Retrieves which excitatory neurons spiked at which timestep.
 
     t_start, t_stop = ts[0], ts[-1]
 
@@ -47,8 +45,10 @@ def prepare_spike_histograms(
 
     # Get neuron positions and spatial grid for histograms
     E_positions = np.asarray(FNSnet.E.positions)
-    domain = np.asarray(FNSnet.E.embedding.domain, dtype=float)
-    grid_size = np.asarray(FNSnet.E.size, dtype=int)
+    domain = np.asarray(FNSnet.E.embedding.domain, dtype=float) # [mm] (width, height) of the square neuron grid. 
+    grid_size = np.asarray(FNSnet.E.size, dtype=int) # Number of neurons in the grid, (width, height)
+
+    # Create grid mesh
     x_edges = np.linspace(0, domain[0], grid_size[0] + 1)
     y_edges = np.linspace(0, domain[1], grid_size[1] + 1)
 
@@ -57,6 +57,7 @@ def prepare_spike_histograms(
 
     # Calculate histogram for each frame
     for i, frame_t in enumerate(frame_times):
+
         # Find time window for the current frame
         win_start_t = frame_t - window_size_ms
         idx_start = np.searchsorted(ts, win_start_t, side="left")
@@ -72,19 +73,16 @@ def prepare_spike_histograms(
             bins=[x_edges, y_edges],
             weights=spike_counts,
         )
+
         histograms[i] = hist
 
     return histograms, frame_times, domain
 
 
-def show_interactive_spiking_activity(
-    histograms,
-    frame_times,
-    domain,
-    fps,
-    playback_speed,
-):
-    """Show spike activity as an interactive Matplotlib heatmap with controls."""
+def show_interactive_spiking_activity(histograms, frame_times, domain, fps, playback_speed,):
+
+    # Show spike activity as an interactive Matplotlib heatmap with controls.
+    
     num_frames = histograms.shape[0]
     max_hist_value = float(np.max(histograms)) if histograms.size else 1.0
     if max_hist_value <= 0:
@@ -221,10 +219,7 @@ def show_interactive_spiking_activity(
 
 
 def main():
-    """
-    Run a spiking neural network simulation and either view it interactively,
-    save it as an animation, or both.
-    """
+    # Run a spiking neural network simulation to view it interactively & save
 
     key = jax.random.PRNGKey(SEED)
 
@@ -236,37 +231,27 @@ def main():
     runner.run(DURATION_MS)
     print("Simulation finished.")
 
-    if MODE in ("interactive", "both"):
-        print("Preparing interactive heatmap data...")
-        histograms, frame_times, domain = prepare_spike_histograms(
-            model,
-            runner,
-            window_size_ms=WINDOW_SIZE_MS,
-            frame_step_ms=FRAME_STEP_MS,
-        )
-        print(
-            "Opening interactive Matplotlib viewer (space toggles play/pause, "
-            "left/right arrows step frames)."
-        )
-        show_interactive_spiking_activity(
-            histograms,
-            frame_times,
-            domain,
-            fps=FPS,
-            playback_speed=PLAYBACK_SPEED,
-        )
 
-    if MODE in ("save", "both"):
-        print("Generating animation for file output...")
-        ani = animate_spiking_activity(
-            model,
-            runner,
-            window_size_ms=WINDOW_SIZE_MS,
-            fps=FPS,
-        )
-        print(f"Saving animation to {OUTPUT} with {FPS} FPS...")
-        ani.save(OUTPUT, writer="imagemagick", fps=FPS)
-        print("Animation saved.")
+
+
+    print("Preparing interactive heatmap data...")
+    histograms, frame_times, domain = prepare_spike_histograms(model, runner, window_size_ms=WINDOW_SIZE_MS, frame_step_ms=FRAME_STEP_MS)
+    
+    print("Opening  Matplotlib viewer...")
+    
+    show_interactive_spiking_activity(histograms, frame_times, domain, fps=FPS, playback_speed=PLAYBACK_SPEED)
+
+
+
+
+    print("Generating animation for file output...")
+    ani = animate_spiking_activity(model, runner, window_size_ms=WINDOW_SIZE_MS, fps=FPS)
+
+    print(f"Saving animation to {OUTPUT} with {FPS} FPS...")
+    ani.save(OUTPUT, writer="imagemagick", fps=FPS)
+    print("Animation saved.")
+
+
 
 
 if __name__ == "__main__":
