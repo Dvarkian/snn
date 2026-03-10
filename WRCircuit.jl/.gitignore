@@ -6,7 +6,6 @@
 *.jld2
 *.mat
 *.mp4
-*.png
 *.pdf
 *.svg
 *.parquet
