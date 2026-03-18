@@ -79,6 +79,10 @@ def _patch_spatial_reinit_weights():
 
         def _assign(proj, target_j, N):
             w = proj.comm.weight
+            if not hasattr(w, "value"):
+                # Plain Python/JAX scalar storage.
+                proj.comm.weight = target_j
+                return
             shape = _weight_shape(w)
             if shape in [(), (1,)]:
                 # Scalar storage: use a single mean weight.
