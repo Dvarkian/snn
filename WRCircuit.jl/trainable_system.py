@@ -151,8 +151,6 @@ def _patch_fns_reset_state():
             g_K = self.init_variable(self._g_K_initializer, batch_size)
             g_K = _expand(g_K, shape)
 
-            # Force float spike dtype for surrogate gradients
-            self.spk_dtype = jnp.float32
             spike = bm.zeros(shape, dtype=jnp.float32)
 
             t_last_spike = bm.ones(shape) * (-1e8)
@@ -166,7 +164,6 @@ def _patch_fns_reset_state():
 
         # Ensure spike dtype is float even when the original reset_state succeeds
         try:
-            self.spk_dtype = jnp.float32
             if self.spike.value.dtype != jnp.float32:
                 shape = self.spike.value.shape
                 self.spike = bm.Variable(bm.zeros(shape, dtype=jnp.float32))
@@ -807,7 +804,9 @@ def collect_rollout(system: TrainableWalkingSystem, features: bm.Array):
         },
         data_first_axis="T",
     )
-    runner.run(inputs=features, reset_state=True)
+    # Reset explicitly without batch sizing to avoid shape mismatches.
+    system.reset_state()
+    runner.run(inputs=features, reset_state=False)
     return runner
 
 
