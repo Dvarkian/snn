@@ -474,6 +474,24 @@ def enable_training_mode(system: TrainableWalkingSystem):
         except Exception:
             pass
 
+    # Ensure spike variables use float dtype for surrogate gradients
+    def _ensure_float_spike(neuron):
+        try:
+            neuron.spk_dtype = bm.float_
+        except Exception:
+            pass
+        try:
+            shape = neuron.spike.value.shape
+        except Exception:
+            shape = neuron.varshape
+        try:
+            neuron.spike = bm.Variable(bm.zeros(shape, dtype=bm.float_))
+        except Exception:
+            pass
+
+    _ensure_float_spike(system.core.E)
+    _ensure_float_spike(system.core.I)
+
 
 def compute_loss(outputs: Tuple[bm.Array, ...], cfg: Config) -> bm.Array:
     pos, vel, force, rate, contact = outputs
