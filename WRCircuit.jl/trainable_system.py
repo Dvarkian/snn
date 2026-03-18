@@ -16,11 +16,15 @@ It also visualizes:
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 import math
 import time
 from typing import Dict, List, Tuple, Optional
 
 import numpy as np
+# Prefer CPU by default to avoid CUDA/cuDNN init failures on systems without GPU setup.
+os.environ.setdefault("JAX_PLATFORM_NAME", "cpu")
+
 import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
@@ -29,7 +33,68 @@ from matplotlib.animation import FuncAnimation
 import brainpy as bp
 import brainpy.math as bm
 
+import src.models.Spatial as spatial_mod
 from src.models.Spatial import Spatial
+
+
+def _patch_spatial_reinit_weights():
+    """Patch Spatial.reinit_weights to tolerate scalar CSRLinear weights.
+
+    Some BrainPy versions construct CSRLinear weights as scalars when g_max
+    is a float. The original Spatial.reinit_weights assigns a per-connection
+    vector, which then triggers a shape mismatch. This patch detects scalar
+    weights and assigns scalar means instead, while keeping the vector path
+    for cases where the weight storage supports per-connection arrays.
+    """
+
+    if getattr(spatial_mod.Spatial, "_safe_reinit_patched", False):
+        return
+
+    def _safe_reinit_weights(self, delta=None, J_e=None):
+        if delta is not None:
+            self.delta = delta
+        if J_e is not None:
+            self.J_ee = J_e[0]
+            self.J_ei = J_e[1]
+
+        self.J_ie = self.J_ee * self.delta
+        self.J_ii = self.J_ei * self.delta
+
+        def _weight_shape(w):
+            try:
+                return tuple(w.value.shape)
+            except Exception:
+                try:
+                    return tuple(w.shape)
+                except Exception:
+                    return ()
+
+        def _assign(proj, target_j, N):
+            w = proj.comm.weight
+            shape = _weight_shape(w)
+            if shape in [(), (1,)]:
+                # Scalar storage: use a single mean weight.
+                w.value = target_j
+                return
+            # Vector storage: use the original correlation logic.
+            self.key, subkey = jax.random.split(self.key)
+            new_w = spatial_mod.correlate_weights(proj, target_j, N, subkey)
+            w.value = new_w
+
+        _assign(self.E2E.proj, self.J_ee, self.N_e)
+        _assign(self.E2I.proj, self.J_ei, self.N_i)
+        _assign(self.I2E.proj, self.J_ie, self.N_e)
+        _assign(self.I2I.proj, self.J_ii, self.N_i)
+        _assign(self.ext2E.proj, self.J_ee, self.N_e)
+        _assign(self.ext2I.proj, self.J_ei, self.N_i)
+        self.reset_state()
+
+    spatial_mod.Spatial._orig_reinit_weights = spatial_mod.Spatial.reinit_weights
+    spatial_mod.Spatial.reinit_weights = _safe_reinit_weights
+    spatial_mod.Spatial._safe_reinit_patched = True
+
+
+_patch_spatial_reinit_weights()
 
 
 # -----------------------------
