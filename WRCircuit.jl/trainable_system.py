@@ -164,6 +164,10 @@ def _patch_fns_reset_state():
 
 _patch_fns_reset_state()
 
+# Ensure stop_gradient exists in neurons module (used in FNSNeuron.update)
+if not hasattr(neurons_mod, "stop_gradient"):
+    neurons_mod.stop_gradient = jax.lax.stop_gradient
+
 
 # -----------------------------
 # Configuration
