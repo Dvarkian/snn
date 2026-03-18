@@ -16,6 +16,7 @@ It also visualizes:
 from __future__ import annotations
 
 from dataclasses import dataclass
+import importlib
 import os
 import math
 import time
@@ -23,7 +24,9 @@ from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 # Prefer CPU by default to avoid CUDA/cuDNN init failures on systems without GPU setup.
-os.environ.setdefault("JAX_PLATFORM_NAME", "cpu")
+# Set SNN_USE_GPU=1 to allow GPU usage.
+if os.environ.get("SNN_USE_GPU", "0") != "1":
+    os.environ["JAX_PLATFORM_NAME"] = "cpu"
 
 import jax
 import jax.numpy as jnp
@@ -33,7 +36,7 @@ from matplotlib.animation import FuncAnimation
 import brainpy as bp
 import brainpy.math as bm
 
-import src.models.Spatial as spatial_mod
+spatial_mod = importlib.import_module("src.models.Spatial")
 from src.models.Spatial import Spatial
 
 
