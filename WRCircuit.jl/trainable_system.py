@@ -131,7 +131,7 @@ def _patch_fns_reset_state():
     def _safe_reset_state(self, batch_size=None, **kwargs):
         # Pre-emptively force float spikes for surrogate gradients
         try:
-            self.spk_dtype = bm.float_
+            self.spk_dtype = jnp.float32
         except Exception:
             pass
         try:
@@ -152,8 +152,8 @@ def _patch_fns_reset_state():
             g_K = _expand(g_K, shape)
 
             # Force float spike dtype for surrogate gradients
-            self.spk_dtype = bm.float_
-            spike = bm.zeros(shape, dtype=bm.float_)
+            self.spk_dtype = jnp.float32
+            spike = bm.zeros(shape, dtype=jnp.float32)
 
             t_last_spike = bm.ones(shape) * (-1e8)
 
@@ -166,10 +166,10 @@ def _patch_fns_reset_state():
 
         # Ensure spike dtype is float even when the original reset_state succeeds
         try:
-            self.spk_dtype = bm.float_
-            if self.spike.value.dtype != bm.float_:
+            self.spk_dtype = jnp.float32
+            if self.spike.value.dtype != jnp.float32:
                 shape = self.spike.value.shape
-                self.spike = bm.Variable(bm.zeros(shape, dtype=bm.float_))
+                self.spike = bm.Variable(bm.zeros(shape, dtype=jnp.float32))
         except Exception:
             pass
 
@@ -180,6 +180,26 @@ def _patch_fns_reset_state():
 
 
 _patch_fns_reset_state()
+
+
+def _patch_fns_init():
+    """Ensure FNSNeuron creates float spike variables from the start."""
+
+    if getattr(neurons_mod.FNSNeuron, "_safe_init_patched", False):
+        return
+
+    orig_init = neurons_mod.FNSNeuron.__init__
+
+    def _safe_init(self, *args, **kwargs):
+        if "spk_dtype" not in kwargs or kwargs["spk_dtype"] is None:
+            kwargs["spk_dtype"] = jnp.float32
+        return orig_init(self, *args, **kwargs)
+
+    neurons_mod.FNSNeuron.__init__ = _safe_init
+    neurons_mod.FNSNeuron._safe_init_patched = True
+
+
+_patch_fns_init()
 
 # Ensure stop_gradient exists in neurons module (used in FNSNeuron.update)
 if not hasattr(neurons_mod, "stop_gradient"):
@@ -494,7 +514,7 @@ def enable_training_mode(system: TrainableWalkingSystem):
     # Ensure spike variables use float dtype for surrogate gradients
     def _ensure_float_spike(neuron):
         try:
-            neuron.spk_dtype = bm.float_
+            neuron.spk_dtype = jnp.float32
         except Exception:
             pass
         try:
@@ -502,7 +522,7 @@ def enable_training_mode(system: TrainableWalkingSystem):
         except Exception:
             shape = neuron.varshape
         try:
-            neuron.spike = bm.Variable(bm.zeros(shape, dtype=bm.float_))
+            neuron.spike = bm.Variable(bm.zeros(shape, dtype=jnp.float32))
         except Exception:
             pass
 
