@@ -246,6 +246,7 @@ class Config:
     lr: float = 3e-3
     eval_every: int = 10
     train_core: bool = False  # if True, also train core synaptic weights (heavy)
+    vis_every: int = 5  # visualize progress every N epochs (0 disables)
 
     # Loss weights
     w_forward: float = 1.0
@@ -593,6 +594,16 @@ def train_system(cfg: Config):
                 f"Forward {forward:.3f} | GradNorm {history['grad_norm'][-1]:.4f}"
             )
 
+        if cfg.vis_every and (epoch + 1) % cfg.vis_every == 0:
+            visualize_progress(
+                system,
+                features,
+                history,
+                cfg,
+                epoch + 1,
+                show_surrogate=(epoch + 1 == cfg.vis_every),
+            )
+
     return system, features, history
 
 
@@ -610,7 +621,7 @@ def evaluate_forward(system: TrainableWalkingSystem, features: bm.Array, cfg: Co
 # -----------------------------
 
 
-def plot_training_history(history: Dict[str, List[float]]):
+def plot_training_history(history: Dict[str, List[float]], title: Optional[str] = None):
     fig, ax = plt.subplots(2, 1, figsize=(8, 6), sharex=False)
 
     ax[0].plot(history["loss"], label="Loss")
@@ -625,11 +636,13 @@ def plot_training_history(history: Dict[str, List[float]]):
     ax[1].set_xlabel("Epoch")
     ax[1].legend()
 
+    if title:
+        fig.suptitle(title)
     plt.tight_layout()
     plt.show()
 
 
-def plot_surrogate_gradient(spk_fun):
+def plot_surrogate_gradient(spk_fun, title: Optional[str] = None):
     xs = bm.linspace(-3, 3, 400)
     try:
         ys = spk_fun(xs)
@@ -651,11 +664,13 @@ def plot_surrogate_gradient(spk_fun):
     ax[1].set_title("Surrogate Gradient")
     ax[1].set_xlabel("x")
     ax[1].set_ylabel("d spk / dx")
+    if title:
+        fig.suptitle(title)
     plt.tight_layout()
     plt.show()
 
 
-def plot_spike_raster(spikes: np.ndarray, sample: int = 200):
+def plot_spike_raster(spikes: np.ndarray, sample: int = 200, title: Optional[str] = None):
     if spikes.ndim != 2:
         return
     num_neurons = spikes.shape[1]
@@ -667,7 +682,7 @@ def plot_spike_raster(spikes: np.ndarray, sample: int = 200):
     plt.scatter(ts, ns, s=2)
     plt.xlabel("Time step")
     plt.ylabel("Neuron index")
-    plt.title("Spike Raster (sampled)")
+    plt.title(title or "Spike Raster (sampled)")
     plt.tight_layout()
     plt.show()
 
@@ -701,7 +716,12 @@ def prepare_spike_histograms(
     return histograms, frame_times
 
 
-def animate_spike_heatmap(histograms: np.ndarray, frame_times: np.ndarray, domain):
+def animate_spike_heatmap(
+    histograms: np.ndarray,
+    frame_times: np.ndarray,
+    domain,
+    title: Optional[str] = None,
+):
     fig, ax = plt.subplots(figsize=(5, 4))
     vmax = max(1.0, float(np.max(histograms)))
     im = ax.imshow(
@@ -714,14 +734,17 @@ def animate_spike_heatmap(histograms: np.ndarray, frame_times: np.ndarray, domai
         interpolation="nearest",
         aspect="auto",
     )
-    title = ax.set_title("")
+    title_artist = ax.set_title("")
     ax.set_xlabel("X")
     ax.set_ylabel("Y")
 
     def update(i):
         im.set_data(histograms[i].T)
-        title.set_text(f"t = {frame_times[i]:.1f} ms")
-        return (im, title)
+        if title:
+            title_artist.set_text(f"{title} | t = {frame_times[i]:.1f} ms")
+        else:
+            title_artist.set_text(f"t = {frame_times[i]:.1f} ms")
+        return (im, title_artist)
 
     ani = FuncAnimation(fig, update, frames=len(frame_times), interval=50, blit=False)
     plt.show()
@@ -733,12 +756,13 @@ def animate_robot(
     forces: np.ndarray,
     contact: np.ndarray,
     cfg: Config,
+    title: Optional[str] = None,
 ):
     fig, ax = plt.subplots(figsize=(6, 4))
     ax.set_aspect("equal", adjustable="box")
     ax.set_xlabel("X")
     ax.set_ylabel("Y")
-    ax.set_title("Walking Robot")
+    ax.set_title(title or "Walking Robot")
 
     leg_angles = np.linspace(0, 2 * np.pi, cfg.n_legs, endpoint=False)
     leg_offsets = np.stack(
@@ -760,7 +784,7 @@ def animate_robot(
         ax.set_aspect("equal", adjustable="box")
         ax.set_xlabel("X")
         ax.set_ylabel("Y")
-        ax.set_title("Walking Robot")
+        ax.set_title(title or "Walking Robot")
 
         p = pos[i]
         ax.plot(p[0], p[1], "o", color="black", markersize=8)
@@ -810,23 +834,23 @@ def collect_rollout(system: TrainableWalkingSystem, features: bm.Array):
     return runner
 
 
-# -----------------------------
-# Main
-# -----------------------------
+def visualize_progress(
+    system: TrainableWalkingSystem,
+    features: bm.Array,
+    history: Dict[str, List[float]],
+    cfg: Config,
+    epoch: int,
+    show_surrogate: bool = False,
+):
+    # Close previous figures to avoid stacking windows.
+    plt.close("all")
 
+    title = f"Epoch {epoch}"
+    plot_training_history(history, title=title)
 
-def main():
-    cfg = Config()
+    if show_surrogate:
+        plot_surrogate_gradient(system.core.E.spk_fun, title=title)
 
-    system, features, history = train_system(cfg)
-
-    # Training curves
-    plot_training_history(history)
-
-    # Surrogate gradient visualization
-    plot_surrogate_gradient(system.core.E.spk_fun)
-
-    # Rollout for visualization
     runner = collect_rollout(system, features)
     spikes = np.asarray(runner.mon["E.spike"])
     pos = np.asarray(runner.mon["pos"])
@@ -834,10 +858,8 @@ def main():
     contact = np.asarray(runner.mon["contact"])
     ts = np.asarray(runner.mon["ts"])
 
-    # Spike raster
-    plot_spike_raster(spikes, sample=cfg.raster_neurons)
+    plot_spike_raster(spikes, sample=cfg.raster_neurons, title=f"{title} | Raster")
 
-    # Spatial heatmap
     histograms, frame_times = prepare_spike_histograms(
         positions=np.asarray(system.core.E.positions),
         domain=np.asarray(system.core.E.embedding.domain, dtype=float),
@@ -848,11 +870,30 @@ def main():
         frame_step_ms=cfg.heatmap_frame_ms,
     )
     animate_spike_heatmap(
-        histograms, frame_times, np.asarray(system.core.E.embedding.domain, dtype=float)
+        histograms,
+        frame_times,
+        np.asarray(system.core.E.embedding.domain, dtype=float),
+        title=f"{title} | Heatmap",
     )
 
-    # Robot animation
-    animate_robot(pos, force, contact, cfg)
+    animate_robot(pos, force, contact, cfg, title=f"{title} | Robot")
+
+
+# -----------------------------
+# Main
+# -----------------------------
+
+
+def main():
+    cfg = Config()
+
+    system, features, history = train_system(cfg)
+
+    # Final visualization (if not already shown at last epoch)
+    if not cfg.vis_every:
+        visualize_progress(system, features, history, cfg, cfg.train_epochs, True)
+    elif cfg.train_epochs % cfg.vis_every != 0:
+        visualize_progress(system, features, history, cfg, cfg.train_epochs, False)
 
 
 if __name__ == "__main__":
