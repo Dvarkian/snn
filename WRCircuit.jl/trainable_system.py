@@ -129,8 +129,13 @@ def _patch_fns_reset_state():
         return arr
 
     def _safe_reset_state(self, batch_size=None, **kwargs):
+        # Pre-emptively force float spikes for surrogate gradients
         try:
-            return orig(self, batch_size=batch_size, **kwargs)
+            self.spk_dtype = bm.float_
+        except Exception:
+            pass
+        try:
+            ret = orig(self, batch_size=batch_size, **kwargs)
         except Exception as exc:
             warnings.warn(f"FNSNeuron.reset_state fallback: {exc}")
 
@@ -145,18 +150,30 @@ def _patch_fns_reset_state():
             V = _expand(V, shape)
             g_K = self.init_variable(self._g_K_initializer, batch_size)
             g_K = _expand(g_K, shape)
-            spike = self.init_variable(
-                partial(bm.zeros, dtype=self.spk_dtype), batch_size
-            )
-            spike = _expand(spike, shape)
+
+            # Force float spike dtype for surrogate gradients
+            self.spk_dtype = bm.float_
+            spike = bm.zeros(shape, dtype=bm.float_)
 
             t_last_spike = bm.ones(shape) * (-1e8)
 
             self.V = V
             self.g_K = g_K
-            self.spike = spike
+            self.spike = bm.Variable(spike)
             self.t_last_spike = t_last_spike
             self.input = bm.Variable(bm.zeros(shape))
+            ret = None
+
+        # Ensure spike dtype is float even when the original reset_state succeeds
+        try:
+            self.spk_dtype = bm.float_
+            if self.spike.value.dtype != bm.float_:
+                shape = self.spike.value.shape
+                self.spike = bm.Variable(bm.zeros(shape, dtype=bm.float_))
+        except Exception:
+            pass
+
+        return ret
 
     neurons_mod.FNSNeuron.reset_state = _safe_reset_state
     neurons_mod.FNSNeuron._safe_reset_patched = True
