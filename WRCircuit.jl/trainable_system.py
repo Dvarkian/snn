@@ -18,6 +18,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 import importlib
 import os
+import warnings
+from functools import partial
 import math
 import time
 from typing import Dict, List, Tuple, Optional
@@ -26,6 +28,8 @@ import numpy as np
 # Prefer CPU by default to avoid CUDA/cuDNN init failures on systems without GPU setup.
 # Set SNN_USE_GPU=1 to allow GPU usage.
 if os.environ.get("SNN_USE_GPU", "0") != "1":
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    os.environ["JAX_PLATFORMS"] = "cpu"
     os.environ["JAX_PLATFORM_NAME"] = "cpu"
 
 import jax
@@ -38,6 +42,7 @@ import brainpy.math as bm
 
 spatial_mod = importlib.import_module("src.models.Spatial")
 from src.models.Spatial import Spatial
+neurons_mod = importlib.import_module("src.neurons")
 
 
 def _patch_spatial_reinit_weights():
@@ -90,7 +95,12 @@ def _patch_spatial_reinit_weights():
         _assign(self.I2I.proj, self.J_ii, self.N_i)
         _assign(self.ext2E.proj, self.J_ee, self.N_e)
         _assign(self.ext2I.proj, self.J_ei, self.N_i)
-        self.reset_state()
+        # Reset can fail in some BrainPy/JAX setups (batch axis mismatch).
+        # Defer reset to the caller if needed.
+        try:
+            self.reset_state()
+        except Exception as exc:
+            warnings.warn(f"Spatial.reset_state skipped during init: {exc}")
 
     spatial_mod.Spatial._orig_reinit_weights = spatial_mod.Spatial.reinit_weights
     spatial_mod.Spatial.reinit_weights = _safe_reinit_weights
@@ -98,6 +108,57 @@ def _patch_spatial_reinit_weights():
 
 
 _patch_spatial_reinit_weights()
+
+
+def _patch_fns_reset_state():
+    """Patch FNSNeuron.reset_state to tolerate scalar initializers."""
+
+    if getattr(neurons_mod.FNSNeuron, "_safe_reset_patched", False):
+        return
+
+    orig = neurons_mod.FNSNeuron.reset_state
+
+    def _expand(val, shape):
+        arr = bm.asarray(val)
+        if arr.shape == ():
+            arr = bm.full(shape, float(arr))
+        return arr
+
+    def _safe_reset_state(self, batch_size=None, **kwargs):
+        try:
+            return orig(self, batch_size=batch_size, **kwargs)
+        except Exception as exc:
+            warnings.warn(f"FNSNeuron.reset_state fallback: {exc}")
+
+            base = self.varshape
+            if isinstance(base, int):
+                base_shape = (base,)
+            else:
+                base_shape = tuple(base)
+            shape = base_shape if batch_size is None else (batch_size,) + base_shape
+
+            V = self.init_variable(self._V_initializer, batch_size)
+            V = _expand(V, shape)
+            g_K = self.init_variable(self._g_K_initializer, batch_size)
+            g_K = _expand(g_K, shape)
+            spike = self.init_variable(
+                partial(bm.zeros, dtype=self.spk_dtype), batch_size
+            )
+            spike = _expand(spike, shape)
+
+            t_last_spike = bm.ones(shape) * (-1e8)
+
+            self.V = V
+            self.g_K = g_K
+            self.spike = spike
+            self.t_last_spike = t_last_spike
+            self.input = bm.Variable(bm.zeros(shape))
+
+    neurons_mod.FNSNeuron.reset_state = _safe_reset_state
+    neurons_mod.FNSNeuron._safe_reset_patched = True
+
+
+_patch_fns_reset_state()
 
 
 # -----------------------------
@@ -377,6 +438,35 @@ class TrainableWalkingSystem(bp.DynamicalSystem):
 # -----------------------------
 
 
+def enable_training_mode(system: TrainableWalkingSystem):
+    """Force training mode on core components to enable surrogate gradients."""
+    if not hasattr(bm, "TrainingMode"):
+        warnings.warn("TrainingMode not available; surrogate gradients may be disabled.")
+        return
+    mode = bm.TrainingMode
+    if isinstance(mode, type):
+        mode = mode()
+
+    system.mode = mode
+    system.core.mode = mode
+    system.core.E.mode = mode
+    system.core.I.mode = mode
+    system.core.ext.mode = mode
+
+    for proj in [
+        system.core.E2E,
+        system.core.E2I,
+        system.core.I2E,
+        system.core.I2I,
+        system.core.ext2E,
+        system.core.ext2I,
+    ]:
+        try:
+            proj.mode = mode
+        except Exception:
+            pass
+
+
 def compute_loss(outputs: Tuple[bm.Array, ...], cfg: Config) -> bm.Array:
     pos, vel, force, rate, contact = outputs
 
@@ -401,9 +491,8 @@ def compute_loss(outputs: Tuple[bm.Array, ...], cfg: Config) -> bm.Array:
 
 def train_system(cfg: Config):
     bm.set_dt(cfg.dt_ms)
-
-    with bm.training_environment():
-        system = TrainableWalkingSystem(cfg)
+    system = TrainableWalkingSystem(cfg)
+    enable_training_mode(system)
 
     num_steps = int(cfg.episode_ms / cfg.dt_ms)
     features = build_feature_sequence(
