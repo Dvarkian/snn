@@ -668,29 +668,36 @@ class LiveVisualizer:
 
         plt.ion()
 
+        # Single figure with multiple subplots (single window).
+        self.fig = plt.figure(figsize=(14, 10))
+        gs = self.fig.add_gridspec(4, 2, height_ratios=[1.0, 1.0, 1.25, 0.75])
+
         # -----------------------------
         # Training history
         # -----------------------------
-        self.fig_hist, self.ax_hist = plt.subplots(2, 1, figsize=(8, 6), sharex=False)
-        self.line_loss, = self.ax_hist[0].plot([], [], label="Loss")
-        self.ax_hist[0].set_ylabel("Loss")
-        self.ax_hist[0].legend()
+        ax_loss = self.fig.add_subplot(gs[0, 0])
+        ax_grad = self.fig.add_subplot(gs[1, 0])
+        self.ax_hist = [ax_loss, ax_grad]
 
-        self.line_grad, = self.ax_hist[1].plot([], [], label="Grad Norm")
-        self.line_forward, = self.ax_hist[1].plot([], [], "o-", label="Forward (eval)")
-        self.ax_hist[1].set_ylabel("Grad Norm / Forward")
-        self.ax_hist[1].set_xlabel("Epoch")
-        self.ax_hist[1].legend()
+        self.line_loss, = ax_loss.plot([], [], label="Loss")
+        ax_loss.set_ylabel("Loss")
+        ax_loss.legend()
+
+        self.line_grad, = ax_grad.plot([], [], label="Grad Norm")
+        self.line_forward, = ax_grad.plot([], [], "o-", label="Forward (eval)")
+        ax_grad.set_ylabel("Grad Norm / Forward")
+        ax_grad.set_xlabel("Epoch")
+        ax_grad.legend()
 
         # -----------------------------
         # Spike raster
         # -----------------------------
-        self.fig_raster, self.ax_raster = plt.subplots(figsize=(8, 4))
+        self.ax_raster = self.fig.add_subplot(gs[0, 1])
 
         # -----------------------------
         # Spike heatmap
         # -----------------------------
-        self.fig_heatmap, self.ax_heatmap = plt.subplots(figsize=(5, 4))
+        self.ax_heatmap = self.fig.add_subplot(gs[2, :])
         self.im = None
         self.heatmap_title = self.ax_heatmap.set_title("")
         self.ax_heatmap.set_xlabel("X")
@@ -701,22 +708,32 @@ class LiveVisualizer:
         # -----------------------------
         # Robot animation
         # -----------------------------
-        self.fig_robot, self.ax_robot = plt.subplots(figsize=(6, 4))
+        self.ax_robot = self.fig.add_subplot(gs[1, 1])
         self.ax_robot.set_aspect("equal", adjustable="box")
         self.ax_robot.set_xlabel("X")
         self.ax_robot.set_ylabel("Y")
         self.ax_robot.axhline(0.0, color="gray", lw=1)
 
         self.body, = self.ax_robot.plot([], [], "o", color="black", markersize=8)
-        self.legs = [self.ax_robot.plot([], [], "-", lw=2)[0] for _ in range(cfg.n_legs)]
-        self.feet = [self.ax_robot.plot([], [], "o", color="tab:blue", ms=4)[0] for _ in range(cfg.n_legs)]
+        self.legs = [
+            self.ax_robot.plot([], [], "-", lw=2)[0] for _ in range(cfg.n_legs)
+        ]
+        self.feet = [
+            self.ax_robot.plot([], [], "o", color="tab:blue", ms=4)[0]
+            for _ in range(cfg.n_legs)
+        ]
         self.force_line, = self.ax_robot.plot([], [], "-", color="tab:red", lw=2)
         self.robot_ani = None
 
         self.leg_angles = np.linspace(0, 2 * np.pi, cfg.n_legs, endpoint=False)
         self.leg_offsets = (
-            np.stack([np.cos(self.leg_angles), np.sin(self.leg_angles)], axis=1) * cfg.leg_radius
+            np.stack([np.cos(self.leg_angles), np.sin(self.leg_angles)], axis=1)
+            * cfg.leg_radius
         )
+
+        # Optional surrogate plots inside same figure.
+        self.ax_sur_spk = self.fig.add_subplot(gs[3, 0])
+        self.ax_sur_grad = self.fig.add_subplot(gs[3, 1])
 
         _LIVE_PLOTTER = self
         plt.show(block=False)
@@ -736,8 +753,8 @@ class LiveVisualizer:
             ax.relim()
             ax.autoscale_view()
 
-        self.fig_hist.suptitle(f"Training (epoch {epoch})")
-        self.fig_hist.canvas.draw_idle()
+        self.fig.suptitle(f"Training (epoch {epoch})")
+        self.fig.canvas.draw_idle()
 
     def update_surrogate(self, spk_fun, title: str):
         if self.surrogate_drawn:
@@ -754,20 +771,22 @@ class LiveVisualizer:
             return
 
         self.surrogate_drawn = True
-        fig, ax = plt.subplots(1, 2, figsize=(8, 3))
-        ax[0].plot(xs_np, ys_np)
-        ax[0].set_title("Surrogate Spike")
-        ax[0].set_xlabel("x")
-        ax[0].set_ylabel("spk(x)")
+        self.ax_sur_spk.clear()
+        self.ax_sur_grad.clear()
 
-        ax[1].plot(xs_np, grads_np)
-        ax[1].set_title("Surrogate Gradient")
-        ax[1].set_xlabel("x")
-        ax[1].set_ylabel("d spk / dx")
+        self.ax_sur_spk.plot(xs_np, ys_np)
+        self.ax_sur_spk.set_title("Surrogate Spike")
+        self.ax_sur_spk.set_xlabel("x")
+        self.ax_sur_spk.set_ylabel("spk(x)")
+
+        self.ax_sur_grad.plot(xs_np, grads_np)
+        self.ax_sur_grad.set_title("Surrogate Gradient")
+        self.ax_sur_grad.set_xlabel("x")
+        self.ax_sur_grad.set_ylabel("d spk / dx")
+
         if title:
-            fig.suptitle(title)
-        fig.canvas.draw_idle()
-        plt.show(block=False)
+            self.fig.suptitle(title)
+        self.fig.canvas.draw_idle()
         plt.pause(0.001)
 
     def update_raster(self, spikes: np.ndarray, title: str):
@@ -785,7 +804,7 @@ class LiveVisualizer:
         self.ax_raster.set_xlabel("Time step")
         self.ax_raster.set_ylabel("Neuron index")
         self.ax_raster.set_title(title or "Spike Raster (sampled)")
-        self.fig_raster.canvas.draw_idle()
+        self.fig.canvas.draw_idle()
 
     def _stop_animation(self, ani):
         if ani is None:
@@ -842,7 +861,7 @@ class LiveVisualizer:
                 aspect="auto",
             )
             if self.cbar is None:
-                self.cbar = self.fig_heatmap.colorbar(self.im, ax=self.ax_heatmap)
+                self.cbar = self.fig.colorbar(self.im, ax=self.ax_heatmap)
                 self.cbar.set_label("Spike Count")
         else:
             self.im.set_data(histograms[frame_indices[0]].T)
@@ -859,15 +878,14 @@ class LiveVisualizer:
             return (self.im, self.heatmap_title)
 
         self.heatmap_ani = FuncAnimation(
-            self.fig_heatmap,
+            self.fig,
             _update,
             frames=len(frame_indices),
             interval=50,
             blit=False,
             repeat=True,
         )
-        self.fig_heatmap.canvas.draw_idle()
-        plt.show(block=False)
+        self.fig.canvas.draw_idle()
         plt.pause(0.001)
 
     def update_robot(self, pos: np.ndarray, forces: np.ndarray, contact: np.ndarray, title: str):
@@ -928,15 +946,14 @@ class LiveVisualizer:
             return [self.body, *self.legs, *self.feet, self.force_line]
 
         self.robot_ani = FuncAnimation(
-            self.fig_robot,
+            self.fig,
             _update,
             frames=len(frame_indices),
             interval=50,
             blit=False,
             repeat=True,
         )
-        self.fig_robot.canvas.draw_idle()
-        plt.show(block=False)
+        self.fig.canvas.draw_idle()
         plt.pause(0.001)
 
 
