@@ -216,9 +216,12 @@ class Config:
     seed: int = 42
 
     # Robot parameters
-    n_legs: int = 4
+    n_legs: int = 2
     mass: float = 1.0
     drag: float = 0.2
+    gravity: float = 1.2  # [force units / mass], downward acceleration in side-view
+    ground_k: float = 25.0  # soft ground penalty strength (keeps y >= 0)
+    height_target: float = 0.35  # desired body height in side-view
     max_force: float = 1.5
     leg_radius: float = 0.15
 
@@ -250,11 +253,14 @@ class Config:
 
     # Loss weights
     w_forward: float = 1.0
-    w_lateral: float = 0.3
+    # In side-view this is the vertical "uprightness" term.
+    w_lateral: float = 0.0
+    w_height: float = 0.35
     w_energy: float = 0.02
     w_spike: float = 0.01
     w_smooth: float = 0.02
     w_contact: float = 0.02
+    w_gait_balance: float = 0.08  # encourage alternating left/right stance
     desired_contact: float = 0.5
 
     # Visualization
@@ -411,7 +417,7 @@ class TrainableWalkingSystem(bp.DynamicalSystem):
     def reset_state(self, batch_size=None, **kwargs):
         self.core.reset_state(batch_size)
         self.rate.value = bm.zeros_like(self.rate.value)
-        self.pos.value = bm.zeros_like(self.pos.value)
+        self.pos.value = bm.asarray([0.0, self.cfg.height_target])
         self.vel.value = bm.zeros_like(self.vel.value)
         self.last_force.value = bm.zeros_like(self.last_force.value)
         self.last_contact.value = bm.zeros_like(self.last_contact.value)
@@ -465,7 +471,14 @@ class TrainableWalkingSystem(bp.DynamicalSystem):
 
         # Robot dynamics (2D point-mass)
         dt = bm.get_dt() / 1000.0
-        acc = total_force / self.cfg.mass - self.cfg.drag * self.vel.value
+        # Side-view dynamics: x forward, y vertical with gravity and a soft ground constraint.
+        # Forces are applied to the body; stance contact modulates which legs contribute.
+        vx, vy = self.vel.value[0], self.vel.value[1]
+        ay_ground = self.cfg.ground_k * bm.relu(-self.pos.value[1])
+        ax = total_force[0] / self.cfg.mass - self.cfg.drag * vx
+        ay = total_force[1] / self.cfg.mass - self.cfg.drag * vy - self.cfg.gravity + ay_ground / self.cfg.mass
+
+        acc = bm.stack([ax, ay])
         self.vel.value = self.vel.value + acc * dt
         self.pos.value = self.pos.value + self.vel.value * dt
 
@@ -532,20 +545,27 @@ def compute_loss(outputs: Tuple[bm.Array, ...], cfg: Config) -> bm.Array:
     pos, vel, force, rate, contact = outputs
 
     forward = pos[-1, 0]
-    lateral = bm.mean(pos[:, 1] ** 2)
+    # Uprightness / height keeping (side-view).
+    height = bm.mean((pos[:, 1] - cfg.height_target) ** 2)
     energy = bm.mean(bm.sum(force**2, axis=-1))
     spike_cost = bm.mean(rate)
     smooth = bm.mean(bm.sum((force[1:] - force[:-1]) ** 2, axis=-1))
     contact_mean = bm.mean(contact, axis=1)
     contact_cost = bm.mean((contact_mean - cfg.desired_contact) ** 2)
+    # Encourage alternating stance between legs (mainly helps 2-leg clarity in animation).
+    if cfg.n_legs >= 2:
+        gait_balance = bm.mean((contact[:, 0] - contact[:, 1]) ** 2)
+    else:
+        gait_balance = 0.0
 
     loss = (
         -cfg.w_forward * forward
-        + cfg.w_lateral * lateral
+        + cfg.w_height * height
         + cfg.w_energy * energy
         + cfg.w_spike * spike_cost
         + cfg.w_smooth * smooth
         + cfg.w_contact * contact_cost
+        - cfg.w_gait_balance * gait_balance
     )
     return loss
 
@@ -577,6 +597,11 @@ def train_system(cfg: Config):
         "timestamp": [],
     }
 
+    plotter = None
+    if cfg.vis_every:
+        # Live, non-blocking visualization during training.
+        plotter = LiveVisualizer(cfg)
+
     for epoch in range(cfg.train_epochs):
         grads, loss = f_grad()
         opt.update(grads)
@@ -585,6 +610,11 @@ def train_system(cfg: Config):
         history["loss"].append(float(bm.as_numpy(loss)))
         history["grad_norm"].append(float(bm.as_numpy(gnorm)))
         history["timestamp"].append(time.time())
+
+        if plotter is not None:
+            plotter.update_history(history, epoch=epoch + 1)
+            # Process GUI events so animations update while training runs.
+            plt.pause(0.001)
 
         if (epoch + 1) % cfg.eval_every == 0 or epoch == 0:
             forward = float(bm.as_numpy(evaluate_forward(system, features, cfg)))
@@ -602,6 +632,7 @@ def train_system(cfg: Config):
                 cfg,
                 epoch + 1,
                 show_surrogate=(epoch + 1 == cfg.vis_every),
+                plotter=plotter,
             )
 
     return system, features, history
@@ -619,6 +650,294 @@ def evaluate_forward(system: TrainableWalkingSystem, features: bm.Array, cfg: Co
 # -----------------------------
 # Visualization helpers
 # -----------------------------
+
+_LIVE_PLOTTER = None
+
+
+class LiveVisualizer:
+    """Non-blocking, persistent visualizer for training progress.
+
+    Avoids blocking `plt.show()` calls by updating artists and running
+    animations via Matplotlib timers (`FuncAnimation`).
+    """
+
+    def __init__(self, cfg: Config):
+        global _LIVE_PLOTTER
+        self.cfg = cfg
+        self.surrogate_drawn = False
+
+        plt.ion()
+
+        # -----------------------------
+        # Training history
+        # -----------------------------
+        self.fig_hist, self.ax_hist = plt.subplots(2, 1, figsize=(8, 6), sharex=False)
+        self.line_loss, = self.ax_hist[0].plot([], [], label="Loss")
+        self.ax_hist[0].set_ylabel("Loss")
+        self.ax_hist[0].legend()
+
+        self.line_grad, = self.ax_hist[1].plot([], [], label="Grad Norm")
+        self.line_forward, = self.ax_hist[1].plot([], [], "o-", label="Forward (eval)")
+        self.ax_hist[1].set_ylabel("Grad Norm / Forward")
+        self.ax_hist[1].set_xlabel("Epoch")
+        self.ax_hist[1].legend()
+
+        # -----------------------------
+        # Spike raster
+        # -----------------------------
+        self.fig_raster, self.ax_raster = plt.subplots(figsize=(8, 4))
+
+        # -----------------------------
+        # Spike heatmap
+        # -----------------------------
+        self.fig_heatmap, self.ax_heatmap = plt.subplots(figsize=(5, 4))
+        self.im = None
+        self.heatmap_title = self.ax_heatmap.set_title("")
+        self.ax_heatmap.set_xlabel("X")
+        self.ax_heatmap.set_ylabel("Y")
+        self.heatmap_ani = None
+        self.cbar = None
+
+        # -----------------------------
+        # Robot animation
+        # -----------------------------
+        self.fig_robot, self.ax_robot = plt.subplots(figsize=(6, 4))
+        self.ax_robot.set_aspect("equal", adjustable="box")
+        self.ax_robot.set_xlabel("X")
+        self.ax_robot.set_ylabel("Y")
+        self.ax_robot.axhline(0.0, color="gray", lw=1)
+
+        self.body, = self.ax_robot.plot([], [], "o", color="black", markersize=8)
+        self.legs = [self.ax_robot.plot([], [], "-", lw=2)[0] for _ in range(cfg.n_legs)]
+        self.feet = [self.ax_robot.plot([], [], "o", color="tab:blue", ms=4)[0] for _ in range(cfg.n_legs)]
+        self.force_line, = self.ax_robot.plot([], [], "-", color="tab:red", lw=2)
+        self.robot_ani = None
+
+        self.leg_angles = np.linspace(0, 2 * np.pi, cfg.n_legs, endpoint=False)
+        self.leg_offsets = (
+            np.stack([np.cos(self.leg_angles), np.sin(self.leg_angles)], axis=1) * cfg.leg_radius
+        )
+
+        _LIVE_PLOTTER = self
+        plt.show(block=False)
+
+    def update_history(self, history: Dict[str, List[float]], epoch: int):
+        epochs = np.arange(1, len(history["loss"]) + 1)
+        self.line_loss.set_data(epochs, history["loss"])
+        self.line_grad.set_data(epochs, history["grad_norm"])
+
+        if history["forward"]:
+            fw_epochs, fwds = zip(*history["forward"])
+            self.line_forward.set_data(fw_epochs, fwds)
+        else:
+            self.line_forward.set_data([], [])
+
+        for ax in self.ax_hist:
+            ax.relim()
+            ax.autoscale_view()
+
+        self.fig_hist.suptitle(f"Training (epoch {epoch})")
+        self.fig_hist.canvas.draw_idle()
+
+    def update_surrogate(self, spk_fun, title: str):
+        if self.surrogate_drawn:
+            return
+        xs = bm.linspace(-3, 3, 400)
+        try:
+            ys = spk_fun(xs)
+            grads = bm.vector_grad(spk_fun)(xs)
+            xs_np = bm.as_numpy(xs)
+            ys_np = bm.as_numpy(ys)
+            grads_np = bm.as_numpy(grads)
+        except Exception as exc:
+            print(f"Surrogate gradient plot failed: {exc}")
+            return
+
+        self.surrogate_drawn = True
+        fig, ax = plt.subplots(1, 2, figsize=(8, 3))
+        ax[0].plot(xs_np, ys_np)
+        ax[0].set_title("Surrogate Spike")
+        ax[0].set_xlabel("x")
+        ax[0].set_ylabel("spk(x)")
+
+        ax[1].plot(xs_np, grads_np)
+        ax[1].set_title("Surrogate Gradient")
+        ax[1].set_xlabel("x")
+        ax[1].set_ylabel("d spk / dx")
+        if title:
+            fig.suptitle(title)
+        fig.canvas.draw_idle()
+        plt.show(block=False)
+        plt.pause(0.001)
+
+    def update_raster(self, spikes: np.ndarray, title: str):
+        if spikes.ndim != 2:
+            return
+        num_neurons = spikes.shape[1]
+        sample = int(self.cfg.raster_neurons)
+        if num_neurons > sample:
+            idx = np.random.choice(num_neurons, sample, replace=False)
+            spikes = spikes[:, idx]
+        ts, ns = np.where(spikes > 0)
+
+        self.ax_raster.clear()
+        self.ax_raster.scatter(ts, ns, s=2)
+        self.ax_raster.set_xlabel("Time step")
+        self.ax_raster.set_ylabel("Neuron index")
+        self.ax_raster.set_title(title or "Spike Raster (sampled)")
+        self.fig_raster.canvas.draw_idle()
+
+    def _stop_animation(self, ani):
+        if ani is None:
+            return
+        try:
+            ani.event_source.stop()
+        except Exception:
+            pass
+
+    def update_heatmap(
+        self,
+        histograms: np.ndarray,
+        frame_times: np.ndarray,
+        domain: np.ndarray,
+        title: str,
+    ):
+        n_frames = int(histograms.shape[0])
+        if n_frames <= 1:
+            return
+
+        max_frames = 220
+        frame_indices = np.linspace(
+            0, n_frames - 1, min(n_frames, max_frames), dtype=int
+        )
+        self._heatmap_frame_indices = frame_indices
+        self._heatmap_histograms = histograms
+        self._heatmap_frame_times = frame_times
+
+        vmax = max(1.0, float(np.max(histograms)))
+
+        # (Re)create im if shape changed.
+        # im displays `histograms[t].T`, so its array shape is transposed.
+        expected_shape = (histograms.shape[2], histograms.shape[1])
+        current_shape = None
+        if self.im is not None:
+            try:
+                current_shape = self.im.get_array().shape
+            except Exception:
+                current_shape = None
+
+        if self.im is None or current_shape != expected_shape:
+            self.ax_heatmap.clear()
+            self.ax_heatmap.set_xlabel("X")
+            self.ax_heatmap.set_ylabel("Y")
+            self.heatmap_title = self.ax_heatmap.set_title("")
+            self.im = self.ax_heatmap.imshow(
+                histograms[frame_indices[0]].T,
+                origin="lower",
+                extent=[0, float(domain[0]), 0, float(domain[1])],
+                cmap="hot",
+                vmin=0,
+                vmax=vmax,
+                interpolation="nearest",
+                aspect="auto",
+            )
+            if self.cbar is None:
+                self.cbar = self.fig_heatmap.colorbar(self.im, ax=self.ax_heatmap)
+                self.cbar.set_label("Spike Count")
+        else:
+            self.im.set_data(histograms[frame_indices[0]].T)
+            self.im.set_clim(vmin=0, vmax=vmax)
+
+        self._stop_animation(self.heatmap_ani)
+
+        def _update(i):
+            t_idx = int(self._heatmap_frame_indices[i])
+            self.im.set_data(self._heatmap_histograms[t_idx].T)
+            self.heatmap_title.set_text(
+                f"{title} | t = {float(frame_times[t_idx]):.1f} ms"
+            )
+            return (self.im, self.heatmap_title)
+
+        self.heatmap_ani = FuncAnimation(
+            self.fig_heatmap,
+            _update,
+            frames=len(frame_indices),
+            interval=50,
+            blit=False,
+            repeat=True,
+        )
+        self.fig_heatmap.canvas.draw_idle()
+        plt.show(block=False)
+        plt.pause(0.001)
+
+    def update_robot(self, pos: np.ndarray, forces: np.ndarray, contact: np.ndarray, title: str):
+        if pos.ndim != 2 or pos.shape[0] < 2:
+            return
+
+        T = int(pos.shape[0])
+        max_frames = 240
+        frame_indices = np.linspace(0, T - 1, min(T, max_frames), dtype=int)
+        self._robot_frame_indices = frame_indices
+        self._robot_pos = pos
+        self._robot_forces = forces
+        self._robot_contact = contact
+
+        self.ax_robot.set_xlim(
+            float(np.min(pos[:, 0])) - 0.5, float(np.max(pos[:, 0])) + 0.5
+        )
+        y_min = min(float(np.min(pos[:, 1])), 0.0) - 0.15
+        y_max = max(float(np.max(pos[:, 1])), float(self.cfg.height_target)) + 0.35
+        self.ax_robot.set_ylim(y_min, y_max)
+        self.ax_robot.set_title(title or "Walking Robot")
+
+        self._stop_animation(self.robot_ani)
+
+        def _update(i):
+            idx = int(self._robot_frame_indices[i])
+            p = self._robot_pos[idx]
+
+            x, y = float(p[0]), float(p[1])
+            self.body.set_data([x], [y])
+
+            for j in range(self.cfg.n_legs):
+                c = float(self._robot_contact[idx, j])  # stance/contact probability
+
+                # Side-view geometry:
+                # - leg base is fixed relative to the hip (x only)
+                # - when c ~ 1: foot is near ground (y ~ 0)
+                # - when c ~ 0: foot swings upward and slightly forward
+                base_x = x + float(self.leg_offsets[j, 0])
+                base_y = y
+
+                t_ms = idx * float(self.cfg.dt_ms)
+                phase = 2.0 * np.pi * float(self.cfg.base_freq_hz) * (t_ms / 1000.0)
+                swing = 0.35 * self.cfg.leg_radius * np.sin(phase + j * np.pi)
+
+                foot_y = (1.0 - c) * (1.0 * self.cfg.leg_radius)
+                foot_x = base_x + (1.0 - c) * swing
+
+                self.legs[j].set_data([base_x, float(foot_x)], [base_y, float(foot_y)])
+                self.feet[j].set_data([float(foot_x)], [max(0.0, float(foot_y))])
+
+            f = self._robot_forces[idx]
+            # Scale for visibility in plot space.
+            f = np.asarray(f, dtype=float)
+            f_scale = 0.35 * self.cfg.leg_radius / max(1e-6, self.cfg.max_force)
+            fx, fy = f[0] * f_scale, f[1] * f_scale
+            self.force_line.set_data([x, x + fx], [y, y + fy])
+            return [self.body, *self.legs, *self.feet, self.force_line]
+
+        self.robot_ani = FuncAnimation(
+            self.fig_robot,
+            _update,
+            frames=len(frame_indices),
+            interval=50,
+            blit=False,
+            repeat=True,
+        )
+        self.fig_robot.canvas.draw_idle()
+        plt.show(block=False)
+        plt.pause(0.001)
 
 
 def plot_training_history(history: Dict[str, List[float]], title: Optional[str] = None):
@@ -841,15 +1160,16 @@ def visualize_progress(
     cfg: Config,
     epoch: int,
     show_surrogate: bool = False,
+    plotter: Optional[LiveVisualizer] = None,
 ):
-    # Close previous figures to avoid stacking windows.
-    plt.close("all")
-
     title = f"Epoch {epoch}"
-    plot_training_history(history, title=title)
+    global _LIVE_PLOTTER
+    if plotter is None:
+        plotter = _LIVE_PLOTTER or LiveVisualizer(cfg)
 
+    plotter.update_history(history, epoch=epoch)
     if show_surrogate:
-        plot_surrogate_gradient(system.core.E.spk_fun, title=title)
+        plotter.update_surrogate(system.core.E.spk_fun, title=title)
 
     runner = collect_rollout(system, features)
     spikes = np.asarray(runner.mon["E.spike"])
@@ -858,7 +1178,11 @@ def visualize_progress(
     contact = np.asarray(runner.mon["contact"])
     ts = np.asarray(runner.mon["ts"])
 
-    plot_spike_raster(spikes, sample=cfg.raster_neurons, title=f"{title} | Raster")
+    forward_end = float(pos[-1, 0]) if pos.size else 0.0
+    height_end = float(pos[-1, 1]) if pos.size else 0.0
+    detailed_title = f"{title} | x_end={forward_end:.3f} y_end={height_end:.3f}"
+
+    plotter.update_raster(spikes, title=f"{title} | Raster")
 
     histograms, frame_times = prepare_spike_histograms(
         positions=np.asarray(system.core.E.positions),
@@ -869,14 +1193,20 @@ def visualize_progress(
         window_ms=cfg.heatmap_window_ms,
         frame_step_ms=cfg.heatmap_frame_ms,
     )
-    animate_spike_heatmap(
+    plotter.update_heatmap(
         histograms,
         frame_times,
         np.asarray(system.core.E.embedding.domain, dtype=float),
-        title=f"{title} | Heatmap",
+        title=detailed_title + " | Heatmap",
     )
 
-    animate_robot(pos, force, contact, cfg, title=f"{title} | Robot")
+    plotter.update_robot(
+        pos,
+        force,
+        contact,
+        title=detailed_title + " | Robot",
+    )
+    plt.pause(0.001)
 
 
 # -----------------------------
@@ -894,6 +1224,13 @@ def main():
         visualize_progress(system, features, history, cfg, cfg.train_epochs, True)
     elif cfg.train_epochs % cfg.vis_every != 0:
         visualize_progress(system, features, history, cfg, cfg.train_epochs, False)
+
+    # Keep the GUI alive briefly so the last updates/animations are visible.
+    # (No blocking behavior during training; this only runs after training.)
+    plt.show(block=False)
+    t_end = time.time() + 5.0
+    while time.time() < t_end and plt.get_fignums():
+        plt.pause(0.1)
 
 
 if __name__ == "__main__":
