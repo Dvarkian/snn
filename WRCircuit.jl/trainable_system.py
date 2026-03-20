@@ -240,13 +240,29 @@ class Config:
 
     # Robot parameters
     n_legs: int = 2
-    mass: float = 1.0
-    drag: float = 0.2
-    gravity: float = 1.2  # [force units / mass], downward acceleration in side-view
-    ground_k: float = 25.0  # soft ground penalty strength (keeps y >= 0)
-    height_target: float = 0.35  # desired body height in side-view
-    max_force: float = 1.5
-    leg_radius: float = 0.15
+    mass: float = 2.0
+    foot_mass: float = 0.15
+    drag: float = 0.15
+    angular_drag: float = 1.5
+    foot_drag: float = 0.5
+    gravity: float = 9.81
+    ground_k: float = 1500.0
+    ground_c: float = 35.0
+    ground_tangent_damping: float = 80.0
+    friction_mu: float = 0.9
+    body_length: float = 0.45
+    body_height: float = 0.18
+    hip_x_offset: float = 0.16
+    leg_radius: float = 0.15  # legacy visualization scale
+    height_target: float = 0.40
+    leg_min_length: float = 0.24
+    leg_max_length: float = 0.42
+    leg_default_length: float = 0.32
+    leg_stiffness: float = 220.0
+    leg_damping: float = 14.0
+    swing_stiffness: float = 260.0
+    swing_damping: float = 18.0
+    max_leg_angle: float = 0.7
 
     # Simulation parameters
     dt_ms: float = 1.0
@@ -262,7 +278,7 @@ class Config:
     input_init_scale: float = 0.05
 
     # Readout
-    out_per_leg: int = 3  # contact, fx, fy
+    out_per_leg: int = 3  # stance, swing angle, leg length
     readout_rank: Optional[int] = 128  # None means full readout
     readout_init_scale: float = 0.02
     rate_decay: float = 0.95
@@ -276,14 +292,15 @@ class Config:
 
     # Loss weights
     w_forward: float = 1.0
-    # In side-view this is the vertical "uprightness" term.
-    w_lateral: float = 0.0
-    w_height: float = 0.35
-    w_energy: float = 0.02
+    w_height: float = 3.0
+    w_pitch: float = 2.0
+    w_omega: float = 0.1
+    w_energy: float = 0.001
     w_spike: float = 0.01
-    w_smooth: float = 0.02
-    w_contact: float = 0.02
-    w_gait_balance: float = 0.08  # encourage alternating left/right stance
+    w_smooth: float = 0.001
+    w_contact: float = 0.05
+    w_slip: float = 0.2
+    w_gait_balance: float = 0.2
     desired_contact: float = 0.5
 
     # Visualization
@@ -363,9 +380,31 @@ class TrainableWalkingSystem(bp.DynamicalSystem):
         super().__init__()
         self.cfg = cfg
 
+        if cfg.n_legs != 2:
+            raise ValueError(
+                "TrainableWalkingSystem currently implements a front-leg/back-leg walker "
+                "and expects n_legs == 2."
+            )
+
         self.n_legs = cfg.n_legs
         self.out_per_leg = cfg.out_per_leg
         self.out_dim = self.n_legs * self.out_per_leg
+        self.body_inertia = cfg.mass * (
+            cfg.body_length**2 + cfg.body_height**2
+        ) / 12.0
+        hip_y = -0.5 * cfg.body_height
+        self.hip_local = bm.asarray(
+            [
+                [cfg.hip_x_offset, hip_y],
+                [-cfg.hip_x_offset, hip_y],
+            ]
+        )
+        self.bottom_corners_local = bm.asarray(
+            [
+                [0.5 * cfg.body_length, -0.5 * cfg.body_height],
+                [-0.5 * cfg.body_length, -0.5 * cfg.body_height],
+            ]
+        )
 
         # Core SNN (same model as run_simulation.py)
         self.core = Spatial(key=cfg.seed, rho=cfg.rho, dx=cfg.dx)
@@ -435,16 +474,70 @@ class TrainableWalkingSystem(bp.DynamicalSystem):
         self.rate = bm.Variable(bm.zeros(self.core.E.varshape))
         self.pos = bm.Variable(bm.zeros((2,)))
         self.vel = bm.Variable(bm.zeros((2,)))
+        self.angle = bm.Variable(bm.asarray(0.0))
+        self.omega = bm.Variable(bm.asarray(0.0))
+        self.foot_pos = bm.Variable(bm.zeros((self.n_legs, 2)))
+        self.foot_vel = bm.Variable(bm.zeros((self.n_legs, 2)))
         self.last_force = bm.Variable(bm.zeros((2,)))
+        self.last_leg_force = bm.Variable(bm.zeros((self.n_legs, 2)))
+        self.last_stance = bm.Variable(bm.zeros((self.n_legs,)))
         self.last_contact = bm.Variable(bm.zeros((self.n_legs,)))
+        self.last_leg_angle_cmd = bm.Variable(bm.zeros((self.n_legs,)))
+        self.last_leg_length_cmd = bm.Variable(bm.zeros((self.n_legs,)))
+
+    def _rotation_matrix(self, theta):
+        c = bm.cos(theta)
+        s = bm.sin(theta)
+        return bm.asarray([[c, -s], [s, c]])
+
+    def _perp(self, vec):
+        return bm.stack([-vec[..., 1], vec[..., 0]], axis=-1)
+
+    def _cross2d(self, a, b):
+        return a[..., 0] * b[..., 1] - a[..., 1] * b[..., 0]
+
+    def _world_points(self, local_points, pos, theta):
+        rot = self._rotation_matrix(theta)
+        return local_points @ rot.T + pos[None, :]
+
+    def _point_velocities(self, world_offsets, linear_vel, omega):
+        return linear_vel[None, :] + omega * self._perp(world_offsets)
+
+    def _ground_forces(self, points, velocities):
+        penetration = bm.relu(-points[:, 1])
+        normal = self.cfg.ground_k * penetration - self.cfg.ground_c * bm.minimum(
+            velocities[:, 1], 0.0
+        )
+        normal = bm.maximum(normal, 0.0)
+        max_tangent = self.cfg.friction_mu * normal
+        tangent = -bm.clip(
+            self.cfg.ground_tangent_damping * velocities[:, 0],
+            -max_tangent,
+            max_tangent,
+        )
+        contact = bm.where(penetration > 1e-6, 1.0, 0.0)
+        return bm.stack([tangent, normal], axis=1), contact
 
     def reset_state(self, batch_size=None, **kwargs):
         self.core.reset_state(batch_size)
         self.rate.value = bm.zeros_like(self.rate.value)
         self.pos.value = bm.asarray([0.0, self.cfg.height_target])
         self.vel.value = bm.zeros_like(self.vel.value)
+        self.angle.value = bm.asarray(0.0)
+        self.omega.value = bm.asarray(0.0)
+        hip_pos = self._world_points(self.hip_local, self.pos.value, self.angle.value)
+        self.foot_pos.value = bm.stack(
+            [hip_pos[:, 0], bm.zeros((self.n_legs,))], axis=1
+        )
+        self.foot_vel.value = bm.zeros_like(self.foot_vel.value)
         self.last_force.value = bm.zeros_like(self.last_force.value)
+        self.last_leg_force.value = bm.zeros_like(self.last_leg_force.value)
+        self.last_stance.value = bm.zeros_like(self.last_stance.value)
         self.last_contact.value = bm.zeros_like(self.last_contact.value)
+        self.last_leg_angle_cmd.value = bm.zeros_like(self.last_leg_angle_cmd.value)
+        self.last_leg_length_cmd.value = (
+            bm.ones_like(self.last_leg_length_cmd.value) * self.cfg.leg_default_length
+        )
 
     def _inject_inputs(self, features: bm.Array):
         coeffs_E = features @ self.W_in_E
@@ -475,10 +568,17 @@ class TrainableWalkingSystem(bp.DynamicalSystem):
         motor_raw = features @ self.W_out + self.b_out
         motor_raw = bm.reshape(motor_raw, (self.n_legs, self.out_per_leg))
 
-        contact = bm.sigmoid(motor_raw[:, 0])
-        fx = bm.tanh(motor_raw[:, 1]) * self.cfg.max_force
-        fy = bm.tanh(motor_raw[:, 2]) * self.cfg.max_force
-        return contact, fx, fy
+        stance = bm.sigmoid(motor_raw[:, 0])
+        swing_angle = bm.tanh(motor_raw[:, 1]) * self.cfg.max_leg_angle
+        length_range = min(
+            self.cfg.leg_default_length - self.cfg.leg_min_length,
+            self.cfg.leg_max_length - self.cfg.leg_default_length,
+        )
+        leg_length = self.cfg.leg_default_length + bm.tanh(motor_raw[:, 2]) * length_range
+        leg_length = bm.clip(
+            leg_length, self.cfg.leg_min_length, self.cfg.leg_max_length
+        )
+        return stance, swing_angle, leg_length
 
     def update(self, features: bm.Array):
         # Inject inputs
@@ -487,30 +587,123 @@ class TrainableWalkingSystem(bp.DynamicalSystem):
         # Run core network
         self.core()
 
-        # Readout to motor commands
-        contact, fx, fy = self._readout()
+        # Readout to leg controls
+        stance_cmd, swing_angle, leg_length_cmd = self._readout()
 
-        forces = bm.stack([fx, fy], axis=1)
-        total_force = bm.sum(forces * contact[:, None], axis=0)
-
-        # Robot dynamics (2D point-mass)
         dt = bm.get_dt() / 1000.0
-        # Side-view dynamics: x forward, y vertical with gravity and a soft ground constraint.
-        # Forces are applied to the body; stance contact modulates which legs contribute.
-        vx, vy = self.vel.value[0], self.vel.value[1]
-        ay_ground = self.cfg.ground_k * bm.relu(-self.pos.value[1])
-        ax = total_force[0] / self.cfg.mass - self.cfg.drag * vx
-        ay = total_force[1] / self.cfg.mass - self.cfg.drag * vy - self.cfg.gravity + ay_ground / self.cfg.mass
 
-        acc = bm.stack([ax, ay])
-        self.vel.value = self.vel.value + acc * dt
-        self.pos.value = self.pos.value + self.vel.value * dt
+        hip_pos = self._world_points(self.hip_local, self.pos.value, self.angle.value)
+        hip_offsets = hip_pos - self.pos.value[None, :]
+        hip_vel = self._point_velocities(hip_offsets, self.vel.value, self.omega.value)
 
-        self.last_force.value = total_force
-        self.last_contact.value = contact
+        leg_vec = self.foot_pos.value - hip_pos
+        leg_len = bm.sqrt(bm.sum(leg_vec**2, axis=1) + 1e-6)
+        leg_dir = leg_vec / leg_len[:, None]
+        rel_vel = self.foot_vel.value - hip_vel
+        rel_speed_along = bm.sum(rel_vel * leg_dir, axis=1)
+
+        spring_force_mag = self.cfg.leg_stiffness * (
+            leg_len - leg_length_cmd
+        ) + self.cfg.leg_damping * rel_speed_along
+        leg_force_on_foot = -spring_force_mag[:, None] * leg_dir
+
+        rot = self._rotation_matrix(self.angle.value)
+        target_local = bm.stack(
+            [
+                bm.sin(swing_angle) * leg_length_cmd,
+                -bm.cos(swing_angle) * leg_length_cmd,
+            ],
+            axis=1,
+        )
+        target_world = target_local @ rot.T + hip_pos
+        swing_blend = 1.0 - stance_cmd
+        swing_force_on_foot = swing_blend[:, None] * (
+            self.cfg.swing_stiffness * (target_world - self.foot_pos.value)
+            - self.cfg.swing_damping * rel_vel
+        )
+
+        foot_ground_force, _ = self._ground_forces(
+            self.foot_pos.value, self.foot_vel.value
+        )
+        foot_gravity = bm.stack(
+            [
+                bm.zeros((self.n_legs,)),
+                bm.ones((self.n_legs,)) * (-self.cfg.foot_mass * self.cfg.gravity),
+            ],
+            axis=1,
+        )
+        total_foot_force = (
+            leg_force_on_foot
+            + swing_force_on_foot
+            + foot_ground_force
+            + foot_gravity
+            - self.cfg.foot_drag * self.foot_vel.value
+        )
+        foot_acc = total_foot_force / self.cfg.foot_mass
+        new_foot_vel = self.foot_vel.value + foot_acc * dt
+        new_foot_pos = self.foot_pos.value + new_foot_vel * dt
+
+        body_leg_force = -(leg_force_on_foot + swing_force_on_foot)
+        bottom_corners = self._world_points(
+            self.bottom_corners_local, self.pos.value, self.angle.value
+        )
+        corner_offsets = bottom_corners - self.pos.value[None, :]
+        corner_vel = self._point_velocities(
+            corner_offsets, self.vel.value, self.omega.value
+        )
+        body_ground_force, _ = self._ground_forces(bottom_corners, corner_vel)
+
+        total_body_force = bm.sum(body_leg_force, axis=0) + bm.sum(
+            body_ground_force, axis=0
+        )
+        total_body_force = total_body_force + bm.asarray(
+            [0.0, -self.cfg.mass * self.cfg.gravity]
+        )
+        total_body_force = total_body_force - self.cfg.drag * self.vel.value
+
+        body_torque = bm.sum(self._cross2d(hip_offsets, body_leg_force))
+        body_torque = body_torque + bm.sum(
+            self._cross2d(corner_offsets, body_ground_force)
+        )
+        body_torque = body_torque - self.cfg.angular_drag * self.omega.value
+
+        body_acc = total_body_force / self.cfg.mass
+        angular_acc = body_torque / self.body_inertia
+
+        new_vel = self.vel.value + body_acc * dt
+        new_pos = self.pos.value + new_vel * dt
+        new_omega = self.omega.value + angular_acc * dt
+        new_angle = self.angle.value + new_omega * dt
+
+        _, ground_contact = self._ground_forces(new_foot_pos, new_foot_vel)
+
+        self.foot_vel.value = new_foot_vel
+        self.foot_pos.value = new_foot_pos
+        self.vel.value = new_vel
+        self.pos.value = new_pos
+        self.omega.value = new_omega
+        self.angle.value = new_angle
+
+        self.last_force.value = total_body_force
+        self.last_leg_force.value = body_leg_force
+        self.last_stance.value = stance_cmd
+        self.last_contact.value = ground_contact
+        self.last_leg_angle_cmd.value = swing_angle
+        self.last_leg_length_cmd.value = leg_length_cmd
 
         mean_rate = bm.mean(self.rate.value)
-        return self.pos.value, self.vel.value, total_force, mean_rate, contact
+        return (
+            self.pos.value,
+            self.vel.value,
+            self.angle.value,
+            self.omega.value,
+            self.last_leg_force.value,
+            mean_rate,
+            stance_cmd,
+            ground_contact,
+            self.foot_pos.value,
+            self.foot_vel.value,
+        )
 
 
 # -----------------------------
@@ -566,29 +759,33 @@ def enable_training_mode(system: TrainableWalkingSystem):
 
 
 def compute_loss(outputs: Tuple[bm.Array, ...], cfg: Config) -> bm.Array:
-    pos, vel, force, rate, contact = outputs
+    pos, _vel, angle, omega, leg_force, rate, _stance, ground_contact, _foot_pos, foot_vel = outputs
 
     forward = pos[-1, 0]
-    # Uprightness / height keeping (side-view).
     height = bm.mean((pos[:, 1] - cfg.height_target) ** 2)
-    energy = bm.mean(bm.sum(force**2, axis=-1))
+    pitch = bm.mean(angle**2)
+    angular_rate = bm.mean(omega**2)
+    energy = bm.mean(bm.sum(leg_force**2, axis=(-1, -2)))
     spike_cost = bm.mean(rate)
-    smooth = bm.mean(bm.sum((force[1:] - force[:-1]) ** 2, axis=-1))
-    contact_mean = bm.mean(contact, axis=1)
+    smooth = bm.mean(bm.sum((leg_force[1:] - leg_force[:-1]) ** 2, axis=(-1, -2)))
+    contact_mean = bm.mean(ground_contact, axis=1)
     contact_cost = bm.mean((contact_mean - cfg.desired_contact) ** 2)
-    # Encourage alternating stance between legs (mainly helps 2-leg clarity in animation).
+    slip = bm.mean(bm.sum(ground_contact * (foot_vel[:, :, 0] ** 2), axis=1))
     if cfg.n_legs >= 2:
-        gait_balance = bm.mean((contact[:, 0] - contact[:, 1]) ** 2)
+        gait_balance = bm.mean((ground_contact[:, 0] - ground_contact[:, 1]) ** 2)
     else:
         gait_balance = 0.0
 
     loss = (
         -cfg.w_forward * forward
         + cfg.w_height * height
+        + cfg.w_pitch * pitch
+        + cfg.w_omega * angular_rate
         + cfg.w_energy * energy
         + cfg.w_spike * spike_cost
         + cfg.w_smooth * smooth
         + cfg.w_contact * contact_cost
+        + cfg.w_slip * slip
         - cfg.w_gait_balance * gait_balance
     )
     return loss
@@ -600,8 +797,13 @@ class RolloutSnapshot:
     ts_ms: np.ndarray
     pos: np.ndarray
     vel: np.ndarray
+    angle: np.ndarray
+    omega: np.ndarray
     force: np.ndarray
-    contact: np.ndarray
+    stance_cmd: np.ndarray
+    ground_contact: np.ndarray
+    foot_pos: np.ndarray
+    leg_force: np.ndarray
     heatmaps: np.ndarray
     heatmap_frame_times_ms: np.ndarray
     heatmap_domain: np.ndarray
@@ -843,7 +1045,8 @@ class LiveDashboard:
         self.ax_robot.axhline(0.0, color="0.6", lw=1.0)
 
         self.robot_path, = self.ax_robot.plot([], [], color="0.75", lw=1.5)
-        self.body, = self.ax_robot.plot([], [], "o", color="black", markersize=8)
+        self.body_box, = self.ax_robot.plot([], [], "-", color="black", lw=2)
+        self.body_com, = self.ax_robot.plot([], [], "o", color="black", markersize=4)
         self.legs = [
             self.ax_robot.plot([], [], "-", lw=2)[0] for _ in range(self.cfg.n_legs)
         ]
@@ -852,16 +1055,24 @@ class LiveDashboard:
             for _ in range(self.cfg.n_legs)
         ]
         self.force_line, = self.ax_robot.plot([], [], "-", color="tab:red", lw=2)
-
-        if self.cfg.n_legs > 1:
-            self.leg_base_offsets = np.linspace(
-                -self.cfg.leg_radius, self.cfg.leg_radius, self.cfg.n_legs
-            )
-        else:
-            self.leg_base_offsets = np.array([0.0])
-        self.leg_phase_offsets = np.linspace(
-            0.0, 2.0 * np.pi, self.cfg.n_legs, endpoint=False
+        self.hip_local = np.array(
+            [
+                [self.cfg.hip_x_offset, -0.5 * self.cfg.body_height],
+                [-self.cfg.hip_x_offset, -0.5 * self.cfg.body_height],
+            ],
+            dtype=float,
         )
+        self.body_outline_local = np.array(
+            [
+                [0.5 * self.cfg.body_length, 0.5 * self.cfg.body_height],
+                [0.5 * self.cfg.body_length, -0.5 * self.cfg.body_height],
+                [-0.5 * self.cfg.body_length, -0.5 * self.cfg.body_height],
+                [-0.5 * self.cfg.body_length, 0.5 * self.cfg.body_height],
+                [0.5 * self.cfg.body_length, 0.5 * self.cfg.body_height],
+            ],
+            dtype=float,
+        )
+        self.force_reference = 1.0
 
     def _setup_heatmap_panel(self):
         self.ax_heatmap.set_title("Spatial Firing")
@@ -914,30 +1125,55 @@ class LiveDashboard:
         )
 
     def _setup_contact_panel(self):
-        self.ax_contact.set_title("Leg Contact")
+        self.ax_contact.set_title("Leg Control / Ground Contact")
         self.ax_contact.set_xlabel("time (ms)")
         self.ax_contact.set_ylabel("contact")
         self.ax_contact.set_ylim(-0.05, 1.05)
-        self.contact_lines = [
-            self.ax_contact.plot([], [], lw=1.5, label=f"Leg {i + 1}")[0]
-            for i in range(self.cfg.n_legs)
-        ]
+        colors = ["tab:blue", "tab:orange"]
+        self.stance_lines = []
+        self.ground_lines = []
+        for i in range(self.cfg.n_legs):
+            color = colors[i % len(colors)]
+            self.stance_lines.append(
+                self.ax_contact.plot(
+                    [], [], lw=1.5, color=color, label=f"Leg {i + 1} cmd"
+                )[0]
+            )
+            self.ground_lines.append(
+                self.ax_contact.plot(
+                    [], [], lw=1.5, ls="--", color=color, label=f"Leg {i + 1} ground"
+                )[0]
+            )
         self.contact_cursor = self.ax_contact.axvline(
             0.0, color="black", lw=1.0, ls="--", alpha=0.6
         )
-        if self.contact_lines:
-            self.ax_contact.legend(loc="upper left", ncol=min(2, self.cfg.n_legs))
+        self.ax_contact.legend(loc="upper left", ncol=2)
 
     def _setup_body_panel(self):
-        self.ax_body.set_title("Body Position")
+        self.ax_body.set_title("Body Pose")
         self.ax_body.set_xlabel("time (ms)")
         self.ax_body.set_ylabel("state")
-        self.line_body_x, = self.ax_body.plot([], [], color="tab:purple", label="x")
-        self.line_body_y, = self.ax_body.plot([], [], color="tab:brown", label="y")
+        self.line_body_height, = self.ax_body.plot(
+            [], [], color="tab:purple", label="height"
+        )
+        self.line_body_pitch, = self.ax_body.plot(
+            [], [], color="tab:brown", label="pitch"
+        )
         self.body_cursor = self.ax_body.axvline(
             0.0, color="black", lw=1.0, ls="--", alpha=0.6
         )
         self.ax_body.legend(loc="upper left")
+
+    def _rotation_matrix_np(self, theta: float) -> np.ndarray:
+        c = np.cos(theta)
+        s = np.sin(theta)
+        return np.array([[c, -s], [s, c]], dtype=float)
+
+    def _world_points_np(
+        self, local_points: np.ndarray, pos: np.ndarray, theta: float
+    ) -> np.ndarray:
+        rot = self._rotation_matrix_np(theta)
+        return local_points @ rot.T + pos[None, :]
 
     def _lookup_index(self, times: np.ndarray, target_time: float) -> int:
         if times.size <= 1:
@@ -982,12 +1218,24 @@ class LiveDashboard:
         self.current_rollout = rollout
         self.playback_started_at = time.perf_counter()
 
-        min_x = float(np.min(rollout.pos[:, 0])) if rollout.pos.size else 0.0
-        max_x = float(np.max(rollout.pos[:, 0])) if rollout.pos.size else 1.0
-        min_y = float(np.min(rollout.pos[:, 1])) if rollout.pos.size else 0.0
-        max_y = float(np.max(rollout.pos[:, 1])) if rollout.pos.size else self.cfg.height_target
-        self.ax_robot.set_xlim(min_x - 0.35, max_x + 0.35)
-        self.ax_robot.set_ylim(min(min_y, 0.0) - 0.15, max(max_y, self.cfg.height_target) + 0.35)
+        body_x = rollout.pos[:, 0]
+        body_y = rollout.pos[:, 1]
+        foot_x = rollout.foot_pos[:, :, 0].reshape(-1)
+        foot_y = rollout.foot_pos[:, :, 1].reshape(-1)
+
+        min_x = float(min(np.min(body_x) - self.cfg.body_length, np.min(foot_x) - 0.1))
+        max_x = float(max(np.max(body_x) + self.cfg.body_length, np.max(foot_x) + 0.1))
+        min_y = float(min(np.min(body_y) - self.cfg.body_height, np.min(foot_y) - 0.05, 0.0))
+        max_y = float(
+            max(
+                np.max(body_y) + self.cfg.body_height,
+                np.max(foot_y) + 0.15,
+                self.cfg.height_target + 0.25,
+            )
+        )
+        self.ax_robot.set_xlim(min_x, max_x)
+        self.ax_robot.set_ylim(min_y, max_y)
+        self.force_reference = max(1.0, float(np.max(np.linalg.norm(rollout.force, axis=1))))
 
         vmax = max(1.0, float(np.max(rollout.heatmaps)))
         self.im.set_data(rollout.heatmaps[0].T)
@@ -1016,40 +1264,40 @@ class LiveDashboard:
         self.ax_raster.set_ylim(-1, max(1, raster_max))
 
         time_axis = rollout.ts_ms
-        for leg_idx, line in enumerate(self.contact_lines):
-            line.set_data(time_axis, rollout.contact[:, leg_idx])
+        for leg_idx, line in enumerate(self.stance_lines):
+            line.set_data(time_axis, rollout.stance_cmd[:, leg_idx])
+        for leg_idx, line in enumerate(self.ground_lines):
+            line.set_data(time_axis, rollout.ground_contact[:, leg_idx])
         self.ax_contact.set_xlim(float(time_axis[0]), float(time_axis[-1]))
 
-        self.line_body_x.set_data(time_axis, rollout.pos[:, 0])
-        self.line_body_y.set_data(time_axis, rollout.pos[:, 1])
+        self.line_body_height.set_data(time_axis, rollout.pos[:, 1])
+        self.line_body_pitch.set_data(time_axis, rollout.angle)
         self.ax_body.set_xlim(float(time_axis[0]), float(time_axis[-1]))
         self.ax_body.relim()
         self.ax_body.autoscale_view()
 
     def _update_robot(self, rollout: RolloutSnapshot, idx: int, current_time_ms: float):
         p = rollout.pos[idx]
+        theta = float(rollout.angle[idx])
         x, y = float(p[0]), float(p[1])
         self.robot_path.set_data(rollout.pos[: idx + 1, 0], rollout.pos[: idx + 1, 1])
-        self.body.set_data([x], [y])
+        body_outline = self._world_points_np(
+            self.body_outline_local, np.asarray([x, y], dtype=float), theta
+        )
+        hip_pos = self._world_points_np(
+            self.hip_local, np.asarray([x, y], dtype=float), theta
+        )
+        self.body_box.set_data(body_outline[:, 0], body_outline[:, 1])
+        self.body_com.set_data([x], [y])
 
         for leg_idx in range(self.cfg.n_legs):
-            contact = float(rollout.contact[idx, leg_idx])
-            base_x = x + float(self.leg_base_offsets[leg_idx])
-            base_y = y
-
-            phase = 2.0 * np.pi * float(self.cfg.base_freq_hz) * (current_time_ms / 1000.0)
-            swing = 0.35 * self.cfg.leg_radius * np.sin(
-                phase + float(self.leg_phase_offsets[leg_idx])
-            )
-
-            foot_y = (1.0 - contact) * self.cfg.leg_radius
-            foot_x = base_x + (1.0 - contact) * swing
-
-            self.legs[leg_idx].set_data([base_x, foot_x], [base_y, foot_y])
-            self.feet[leg_idx].set_data([foot_x], [max(0.0, foot_y)])
+            foot = rollout.foot_pos[idx, leg_idx]
+            hip = hip_pos[leg_idx]
+            self.legs[leg_idx].set_data([hip[0], foot[0]], [hip[1], foot[1]])
+            self.feet[leg_idx].set_data([foot[0]], [max(0.0, foot[1])])
 
         force = np.asarray(rollout.force[idx], dtype=float)
-        force_scale = 0.35 * self.cfg.leg_radius / max(1e-6, self.cfg.max_force)
+        force_scale = 0.35 * self.cfg.body_length / max(1e-6, self.force_reference)
         self.force_line.set_data(
             [x, x + force[0] * force_scale],
             [y, y + force[1] * force_scale],
@@ -1057,8 +1305,8 @@ class LiveDashboard:
 
         t_rel = current_time_ms - float(rollout.ts_ms[0])
         self.ax_robot.set_title(
-            f"Walking Animation | epoch {rollout.epoch} | t={t_rel:.0f} ms | "
-            f"x={x:.3f} y={y:.3f}"
+            f"Rigid Walker | epoch {rollout.epoch} | t={t_rel:.0f} ms | "
+            f"x={x:.3f} y={y:.3f} pitch={theta:.3f}"
         )
 
     def _update_playback(self):
@@ -1344,8 +1592,13 @@ def collect_rollout(system: TrainableWalkingSystem, features: bm.Array):
             "E.spike": system.core.E.spike,
             "pos": system.pos,
             "vel": system.vel,
+            "angle": system.angle,
+            "omega": system.omega,
             "force": system.last_force,
-            "contact": system.last_contact,
+            "stance": system.last_stance,
+            "ground_contact": system.last_contact,
+            "foot_pos": system.foot_pos,
+            "leg_force": system.last_leg_force,
         },
         data_first_axis="T",
     )
@@ -1386,8 +1639,13 @@ def build_rollout_snapshot(
     spikes = np.asarray(runner.mon["E.spike"])
     pos = np.asarray(runner.mon["pos"], dtype=float)
     vel = np.asarray(runner.mon["vel"], dtype=float)
+    angle = np.asarray(runner.mon["angle"], dtype=float)
+    omega = np.asarray(runner.mon["omega"], dtype=float)
     force = np.asarray(runner.mon["force"], dtype=float)
-    contact = np.asarray(runner.mon["contact"], dtype=float)
+    stance_cmd = np.asarray(runner.mon["stance"], dtype=float)
+    ground_contact = np.asarray(runner.mon["ground_contact"], dtype=float)
+    foot_pos = np.asarray(runner.mon["foot_pos"], dtype=float)
+    leg_force = np.asarray(runner.mon["leg_force"], dtype=float)
     ts_ms = np.asarray(runner.mon["ts"], dtype=float)
 
     domain = np.asarray(system.core.E.embedding.domain, dtype=float)
@@ -1415,8 +1673,13 @@ def build_rollout_snapshot(
         ts_ms=ts_ms,
         pos=pos,
         vel=vel,
+        angle=angle,
+        omega=omega,
         force=force,
-        contact=contact,
+        stance_cmd=stance_cmd,
+        ground_contact=ground_contact,
+        foot_pos=foot_pos,
+        leg_force=leg_force,
         heatmaps=heatmaps,
         heatmap_frame_times_ms=heatmap_frame_times_ms,
         heatmap_domain=domain,
