@@ -282,6 +282,7 @@ class FNSNeuron(GradNeuDyn):
             g_K = bm.where(spike, g_K + self.Delta_g_K, g_K)
 
         # update variables
+        spike = bm.asarray(spike, dtype=self.spike.value.dtype)
         self.V.value = V
         self.g_K.value = g_K
         self.input.value = I  # I_rec

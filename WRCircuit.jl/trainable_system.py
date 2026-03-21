@@ -61,6 +61,7 @@ if os.environ.get("SNN_USE_GPU", "0") != "1":
 
 import jax
 import jax.numpy as jnp
+from jax.experimental import sparse as jsparse
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 
@@ -72,6 +73,7 @@ from walking_physics import WalkerPhysics, WalkerState
 spatial_mod = importlib.import_module("src.models.Spatial")
 from src.models.Spatial import Spatial
 neurons_mod = importlib.import_module("src.neurons")
+linear_mod = importlib.import_module("brainpy._src.dnn.linear")
 
 
 def _patch_spatial_reinit_weights():
@@ -230,6 +232,51 @@ _patch_fns_init()
 # Ensure stop_gradient exists in neurons module (used in FNSNeuron.update)
 if not hasattr(neurons_mod, "stop_gradient"):
     neurons_mod.stop_gradient = jax.lax.stop_gradient
+
+
+def _patch_csrlinear_update():
+    """Avoid Taichi CSR matvec failures by using JAX sparse BCOO matvec."""
+
+    if getattr(linear_mod.CSRLinear, "_safe_bcoo_update_patched", False):
+        return
+
+    def _csr_rows(indptr):
+        indptr_np = np.asarray(indptr, dtype=np.int32)
+        counts = np.diff(indptr_np)
+        return np.repeat(np.arange(counts.shape[0], dtype=np.int32), counts)
+
+    def _safe_update(self, x):
+        rows = _csr_rows(self.indptr)
+        indices_np = np.asarray(self.indices, dtype=np.int32)
+        bcoo_indices = jnp.asarray(np.stack([rows, indices_np], axis=1), dtype=jnp.int32)
+
+        data = jnp.asarray(self.weight)
+        if data.shape in [(), (1,)]:
+            data = jnp.broadcast_to(jnp.reshape(data, (1,)), (self.indices.shape[0],))
+        else:
+            data = jnp.reshape(data, (self.indices.shape[0],))
+
+        mat = jsparse.BCOO(
+            (data, bcoo_indices),
+            shape=(self.conn.pre_num, self.conn.post_num),
+        )
+
+        if x.ndim == 1:
+            return mat.T @ x if self.transpose else mat @ x
+        elif x.ndim > 1:
+            shapes = x.shape[:-1]
+            x = bm.flatten(x, end_dim=-2)
+            y = x @ mat if self.transpose else x @ mat.T
+            return bm.reshape(y, shapes + (y.shape[-1],))
+        else:
+            raise ValueError
+
+    linear_mod.CSRLinear._orig_update = linear_mod.CSRLinear.update
+    linear_mod.CSRLinear.update = _safe_update
+    linear_mod.CSRLinear._safe_bcoo_update_patched = True
+
+
+_patch_csrlinear_update()
 
 
 # -----------------------------
