@@ -6,9 +6,9 @@ injects low-dimensional inputs through fixed spatial patterns, and trains
 readout weights with surrogate gradients + BPTT to make a rigid rectangular
 body with front and back two-link legs walk forward on level ground.
 
-The network outputs hip and knee angle targets for each leg. The body and
-legs are advanced with articulated rigid-body dynamics plus compliant ground
-contact, so the walker can in principle lose contact and jump ballistically.
+The controller still trains against the existing differentiable JAX walker
+proxy, but rollouts, evaluation, and visualization now use the same Pymunk
+contact simulation as run_walking_physics.py.
 
 It also visualizes:
 - training curves
@@ -27,6 +27,7 @@ import traceback
 import warnings
 import math
 import time
+from types import SimpleNamespace
 from typing import Dict, List, Tuple, Optional
 
 import numpy as np
@@ -67,8 +68,15 @@ from matplotlib.animation import FuncAnimation
 
 import brainpy as bp
 import brainpy.math as bm
+from brainpy._src.helpers import clear_input
 
-from walking_physics import WalkerPhysics, WalkerState
+from walking_physics import (
+    WalkerPhysics,
+    WalkerSensors,
+    WalkerState,
+    WalkerStepResult,
+)
+from walking_physics_pymunk import PymunkPassiveWalker, make_initial_state
 
 spatial_mod = importlib.import_module("src.models.Spatial")
 from src.models.Spatial import Spatial
@@ -307,7 +315,9 @@ class Config:
     body_length: float = 0.45
     body_height: float = 0.18
     hip_x_offset: float = 0.16
-    leg_radius: float = 0.15  # deprecated; retained for compatibility only
+    leg_radius: float = 0.022
+    foot_radius: float = 0.028
+    body_corner_radius: float = 0.012
     thigh_length: float = 0.22
     shank_length: float = 0.22
     height_target: float = 0.48
@@ -327,6 +337,18 @@ class Config:
     base_freq_hz: float = 1.5
     target_vx: float = 0.4
     target_vy: float = 0.0
+    physics_substeps: int = 10
+    solver_iterations: int = 50
+    collision_slop: float = 1e-3
+    contact_epsilon: float = 2e-3
+    drop_height: float = 0.16
+    initial_pitch: float = 0.22
+    initial_omega: float = 0.0
+    initial_body_x: float = 0.0
+    initial_body_vx: float = 0.0
+    initial_body_vy: float = 0.0
+    hip_offsets: Tuple[float, float] = (0.18, -0.10)
+    knee_offsets: Tuple[float, float] = (-0.10, 0.06)
 
     # Input injection
     feature_dim: int = 7  # [1, target_vx, target_vy, sin, cos, sin2, cos2]
@@ -428,6 +450,149 @@ def global_norm(grads: Dict[str, bm.Array]) -> bm.Array:
 
 
 # -----------------------------
+# Physics backends
+# -----------------------------
+
+
+class ControlledPymunkWalker(PymunkPassiveWalker):
+    """Pymunk walker with explicit joint-angle targets."""
+
+    def __init__(self, cfg, initial_state):
+        self.hip_targets = np.asarray(initial_state.hip_angle, dtype=float)
+        self.knee_targets = np.asarray(initial_state.knee_angle, dtype=float)
+        self.last_joint_torque = np.zeros((cfg.n_legs, 2), dtype=float)
+        super().__init__(cfg, initial_state)
+
+    def set_targets(self, hip_target, knee_target):
+        self.hip_targets = np.asarray(hip_target, dtype=float).reshape(self.cfg.n_legs)
+        self.knee_targets = np.asarray(knee_target, dtype=float).reshape(self.cfg.n_legs)
+
+    def _apply_joint_torques(self):
+        cfg = self.cfg
+        joint_torque = np.zeros((cfg.n_legs, 2), dtype=float)
+
+        for leg_idx in range(cfg.n_legs):
+            thigh = self.thigh_bodies[leg_idx]
+            shank = self.shank_bodies[leg_idx]
+
+            hip_angle = float(thigh.angle - self.body.angle)
+            knee_angle = float(shank.angle - thigh.angle)
+            hip_omega = float(thigh.angular_velocity - self.body.angular_velocity)
+            knee_omega = float(shank.angular_velocity - thigh.angular_velocity)
+
+            hip_tau_cmd = cfg.hip_kp * (self.hip_targets[leg_idx] - hip_angle)
+            hip_tau_cmd = hip_tau_cmd - cfg.hip_kd * hip_omega
+            hip_tau_cmd = float(
+                np.clip(hip_tau_cmd, -cfg.hip_torque_limit, cfg.hip_torque_limit)
+            )
+
+            knee_tau_cmd = cfg.knee_kp * (self.knee_targets[leg_idx] - knee_angle)
+            knee_tau_cmd = knee_tau_cmd - cfg.knee_kd * knee_omega
+            knee_tau_cmd = float(
+                np.clip(knee_tau_cmd, -cfg.knee_torque_limit, cfg.knee_torque_limit)
+            )
+
+            joint_torque[leg_idx, 0] = hip_tau_cmd
+            joint_torque[leg_idx, 1] = knee_tau_cmd
+
+            hip_tau = hip_tau_cmd - cfg.joint_drag * hip_omega
+            knee_tau = knee_tau_cmd - cfg.joint_drag * knee_omega
+
+            self.body.torque -= hip_tau
+            thigh.torque += hip_tau - knee_tau
+            shank.torque += knee_tau
+
+        self.last_joint_torque = joint_torque
+
+
+class PymunkWalkerPhysicsAdapter:
+    """Match the differentiable walker API with the Pymunk backend."""
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self._walker: Optional[ControlledPymunkWalker] = None
+
+    def _hip_offsets(self) -> np.ndarray:
+        return np.asarray(getattr(self.cfg, "hip_offsets", (0.0, 0.0)), dtype=float)
+
+    def _knee_offsets(self) -> np.ndarray:
+        return np.asarray(getattr(self.cfg, "knee_offsets", (0.0, 0.0)), dtype=float)
+
+    def _initial_passive_state(self):
+        return make_initial_state(
+            self.cfg,
+            hip_offsets=self._hip_offsets(),
+            knee_offsets=self._knee_offsets(),
+        )
+
+    def _walker_state_to_passive(self, state: WalkerState):
+        return self._initial_passive_state().__class__(
+            pos=np.asarray(state.pos, dtype=float),
+            vel=np.asarray(state.vel, dtype=float),
+            angle=float(state.angle),
+            omega=float(state.omega),
+            hip_angle=np.asarray(state.hip_angle, dtype=float),
+            knee_angle=np.asarray(state.knee_angle, dtype=float),
+            hip_omega=np.asarray(state.hip_omega, dtype=float),
+            knee_omega=np.asarray(state.knee_omega, dtype=float),
+        )
+
+    def _to_walker_state(self, state) -> WalkerState:
+        return WalkerState(
+            pos=bm.asarray(state.pos),
+            vel=bm.asarray(state.vel),
+            angle=bm.asarray(state.angle),
+            omega=bm.asarray(state.omega),
+            hip_angle=bm.asarray(state.hip_angle),
+            knee_angle=bm.asarray(state.knee_angle),
+            hip_omega=bm.asarray(state.hip_omega),
+            knee_omega=bm.asarray(state.knee_omega),
+        )
+
+    def _rebuild(self, state: Optional[WalkerState] = None):
+        passive_state = (
+            self._initial_passive_state()
+            if state is None
+            else self._walker_state_to_passive(state)
+        )
+        self._walker = ControlledPymunkWalker(self.cfg, passive_state)
+        self._walker.set_targets(passive_state.hip_angle, passive_state.knee_angle)
+        return passive_state
+
+    def _ensure_walker(self, state: Optional[WalkerState] = None):
+        if self._walker is None:
+            return self._rebuild(state)
+        return None
+
+    def initial_state(self) -> WalkerState:
+        passive_state = self._rebuild()
+        return self._to_walker_state(passive_state)
+
+    def sense(self, state: WalkerState) -> WalkerSensors:
+        self._ensure_walker(state)
+        sensed = self._walker.observe()
+        return WalkerSensors(
+            foot_pos=bm.asarray(sensed.foot_pos),
+            foot_vel=bm.asarray(sensed.foot_vel),
+            ground_contact=bm.asarray(sensed.ground_contact),
+        )
+
+    def step(self, state: WalkerState, hip_target, knee_target) -> WalkerStepResult:
+        self._ensure_walker(state)
+        self._walker.set_targets(hip_target, knee_target)
+        self._walker.step()
+        sensed = self._walker.observe()
+        return WalkerStepResult(
+            state=self._to_walker_state(sensed),
+            foot_pos=bm.asarray(sensed.foot_pos),
+            foot_vel=bm.asarray(sensed.foot_vel),
+            ground_contact=bm.asarray(sensed.ground_contact),
+            total_ground_force=bm.asarray(sensed.total_ground_force),
+            joint_torque=bm.asarray(self._walker.last_joint_torque),
+        )
+
+
+# -----------------------------
 # Trainable system
 # -----------------------------
 
@@ -446,7 +611,9 @@ class TrainableWalkingSystem(bp.DynamicalSystem):
         self.n_legs = cfg.n_legs
         self.out_per_leg = cfg.out_per_leg
         self.out_dim = self.n_legs * self.out_per_leg
-        self.physics = WalkerPhysics(cfg)
+        self.diff_physics = WalkerPhysics(cfg)
+        self.pymunk_physics = PymunkWalkerPhysicsAdapter(cfg)
+        self.physics_backend = "differentiable"
 
         # Core SNN (same model as run_simulation.py)
         self.core = Spatial(key=cfg.seed, rho=cfg.rho, dx=cfg.dx)
@@ -530,6 +697,33 @@ class TrainableWalkingSystem(bp.DynamicalSystem):
         self.last_hip_target = bm.Variable(bm.zeros((self.n_legs,)))
         self.last_knee_target = bm.Variable(bm.zeros((self.n_legs,)))
 
+    def set_physics_backend(self, backend: str):
+        if backend not in {"differentiable", "pymunk"}:
+            raise ValueError(f"Unsupported physics backend: {backend}")
+        self.physics_backend = backend
+
+    def _active_physics(self):
+        if self.physics_backend == "pymunk":
+            return self.pymunk_physics
+        return self.diff_physics
+
+    def _initial_state(self) -> WalkerState:
+        passive_state = make_initial_state(
+            self.cfg,
+            hip_offsets=np.asarray(self.cfg.hip_offsets, dtype=float),
+            knee_offsets=np.asarray(self.cfg.knee_offsets, dtype=float),
+        )
+        return WalkerState(
+            pos=bm.asarray(passive_state.pos),
+            vel=bm.asarray(passive_state.vel),
+            angle=bm.asarray(passive_state.angle),
+            omega=bm.asarray(passive_state.omega),
+            hip_angle=bm.asarray(passive_state.hip_angle),
+            knee_angle=bm.asarray(passive_state.knee_angle),
+            hip_omega=bm.asarray(passive_state.hip_omega),
+            knee_omega=bm.asarray(passive_state.knee_omega),
+        )
+
     def _physics_state(self) -> WalkerState:
         return WalkerState(
             pos=self.pos.value,
@@ -562,9 +756,10 @@ class TrainableWalkingSystem(bp.DynamicalSystem):
     def reset_state(self, batch_size=None, **kwargs):
         self.core.reset_state(batch_size)
         self.rate.value = bm.zeros_like(self.rate.value)
-        state = self.physics.initial_state()
+        physics = self._active_physics()
+        state = physics.initial_state() if self.physics_backend == "pymunk" else self._initial_state()
         self._set_physics_state(state)
-        sensed = self.physics.sense(state)
+        sensed = physics.sense(state)
         self.last_foot_pos.value = sensed.foot_pos
         self.last_foot_vel.value = sensed.foot_vel
         self.last_force.value = bm.zeros_like(self.last_force.value)
@@ -611,7 +806,7 @@ class TrainableWalkingSystem(bp.DynamicalSystem):
         self.core()
 
         hip_target, knee_target = self._readout()
-        step = self.physics.step(self._physics_state(), hip_target, knee_target)
+        step = self._active_physics().step(self._physics_state(), hip_target, knee_target)
         self._set_physics_state(step.state)
         self.last_foot_pos.value = step.foot_pos
         self.last_foot_vel.value = step.foot_vel
@@ -841,6 +1036,7 @@ def train_system(cfg: Config, dashboard_state: Optional[DashboardState] = None):
     indices = bm.arange(num_steps)
 
     def loss_fn():
+        system.set_physics_backend("differentiable")
         system.reset_state()
         outputs = bm.for_loop(system.step_run, (indices, features))
         return compute_loss(outputs, cfg)
@@ -920,12 +1116,10 @@ def train_system(cfg: Config, dashboard_state: Optional[DashboardState] = None):
 
 
 def evaluate_forward(system: TrainableWalkingSystem, features: bm.Array, cfg: Config):
-    num_steps = features.shape[0]
-    indices = bm.arange(num_steps)
-    system.reset_state()
-    outputs = bm.for_loop(system.step_run, (indices, features))
-    pos = outputs[0]
-    return pos[-1, 0]
+    runner = collect_rollout(system, features, backend="pymunk")
+    pos = np.asarray(runner.mon["pos"], dtype=float)
+    forward = float(pos[-1, 0]) if pos.size else 0.0
+    return bm.asarray(forward)
 
 
 # -----------------------------
@@ -1600,30 +1794,89 @@ def animate_robot(
     return ani
 
 
-def collect_rollout(system: TrainableWalkingSystem, features: bm.Array):
-    runner = bp.DSRunner(
-        system,
-        monitors={
-            "E.spike": system.core.E.spike,
-            "pos": system.pos,
-            "vel": system.vel,
-            "angle": system.angle,
-            "omega": system.omega,
-            "force": system.last_force,
-            "hip_angle": system.hip_angle,
-            "knee_angle": system.knee_angle,
-            "hip_target": system.last_hip_target,
-            "knee_target": system.last_knee_target,
-            "ground_contact": system.last_contact,
-            "foot_pos": system.last_foot_pos,
-            "joint_torque": system.last_joint_torque,
-        },
-        data_first_axis="T",
-    )
-    # Reset explicitly without batch sizing to avoid shape mismatches.
+def collect_rollout(
+    system: TrainableWalkingSystem,
+    features: bm.Array,
+    backend: str = "pymunk",
+):
+    previous_backend = system.physics_backend
+    system.set_physics_backend(backend)
+    try:
+        if backend == "pymunk":
+            return _collect_rollout_python(system, features)
+
+        runner = bp.DSRunner(
+            system,
+            monitors={
+                "E.spike": system.core.E.spike,
+                "pos": system.pos,
+                "vel": system.vel,
+                "angle": system.angle,
+                "omega": system.omega,
+                "force": system.last_force,
+                "hip_angle": system.hip_angle,
+                "knee_angle": system.knee_angle,
+                "hip_target": system.last_hip_target,
+                "knee_target": system.last_knee_target,
+                "ground_contact": system.last_contact,
+                "foot_pos": system.last_foot_pos,
+                "joint_torque": system.last_joint_torque,
+            },
+            data_first_axis="T",
+        )
+        # Reset explicitly without batch sizing to avoid shape mismatches.
+        system.reset_state()
+        runner.run(inputs=features, reset_state=False)
+        return runner
+    finally:
+        system.set_physics_backend(previous_backend)
+
+
+def _collect_rollout_python(system: TrainableWalkingSystem, features: bm.Array):
     system.reset_state()
-    runner.run(inputs=features, reset_state=False)
-    return runner
+
+    num_steps = int(features.shape[0])
+    dt = float(bm.get_dt())
+    mon = {
+        "E.spike": [],
+        "pos": [],
+        "vel": [],
+        "angle": [],
+        "omega": [],
+        "force": [],
+        "hip_angle": [],
+        "knee_angle": [],
+        "hip_target": [],
+        "knee_target": [],
+        "ground_contact": [],
+        "foot_pos": [],
+        "joint_torque": [],
+        "ts": [],
+    }
+
+    for i in range(num_steps):
+        bp.share.save(t=i * dt, i=i, dt=dt)
+        system(features[i])
+
+        mon["E.spike"].append(np.asarray(system.core.E.spike))
+        mon["pos"].append(np.asarray(system.pos.value, dtype=float))
+        mon["vel"].append(np.asarray(system.vel.value, dtype=float))
+        mon["angle"].append(float(system.angle.value))
+        mon["omega"].append(float(system.omega.value))
+        mon["force"].append(np.asarray(system.last_force.value, dtype=float))
+        mon["hip_angle"].append(np.asarray(system.hip_angle.value, dtype=float))
+        mon["knee_angle"].append(np.asarray(system.knee_angle.value, dtype=float))
+        mon["hip_target"].append(np.asarray(system.last_hip_target.value, dtype=float))
+        mon["knee_target"].append(np.asarray(system.last_knee_target.value, dtype=float))
+        mon["ground_contact"].append(np.asarray(system.last_contact.value, dtype=float))
+        mon["foot_pos"].append(np.asarray(system.last_foot_pos.value, dtype=float))
+        mon["joint_torque"].append(np.asarray(system.last_joint_torque.value, dtype=float))
+        mon["ts"].append(i * dt)
+
+        clear_input(system)
+
+    stacked = {key: np.asarray(value) for key, value in mon.items()}
+    return SimpleNamespace(mon=stacked)
 
 
 def select_raster_indices(num_neurons: int, sample: int) -> np.ndarray:
