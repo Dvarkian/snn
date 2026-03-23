@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import time
 import os
 from types import SimpleNamespace
 from typing import Any, Dict, Optional
@@ -718,6 +719,12 @@ class TrainingViewer:
         self.frame_times = np.asarray([0.0], dtype=float)
         self.frame_ptr = 0
         self.histograms = np.zeros((1, self.system.exc_side, self.system.exc_side), dtype=float)
+        self.current_phase = "starting"
+        self.phase_detail = "initializing viewer"
+        self.last_phase_seconds = 0.0
+        self.train_tick_count = 0
+        self.start_time = time.perf_counter()
+        self.last_log_time = self.start_time
 
         self.fig = plt.figure(figsize=(14, 8))
         gs = self.fig.add_gridspec(2, 2, width_ratios=[1.15, 1.0], hspace=0.30, wspace=0.28)
@@ -731,10 +738,10 @@ class TrainingViewer:
         self._init_robot_panel()
         self._init_metric_panel()
 
-        self.ax_status.axis("off")
+        self._init_status_panel()
         self.status_text = self.ax_status.text(
             0.0,
-            1.0,
+            0.98,
             "",
             va="top",
             ha="left",
@@ -744,8 +751,10 @@ class TrainingViewer:
 
         self.fig.canvas.mpl_connect("close_event", self._on_close)
 
+        self._set_phase("evaluating", "running initial rollout")
         rollout, metrics = self.system.evaluate(self.features)
         self._set_rollout(rollout, metrics)
+        self._set_phase("idle", "ready to train")
         self._refresh_status()
 
         self.anim_timer = self.fig.canvas.new_timer(
@@ -802,6 +811,29 @@ class TrainingViewer:
         self.ax_metric.set_xlabel("epoch")
         self.ax_metric.legend(loc="upper left")
         self.ax_metric.grid(alpha=0.25)
+
+    def _init_status_panel(self):
+        self.ax_status.set_xlim(0.0, 1.0)
+        self.ax_status.set_ylim(0.0, 1.0)
+        self.ax_status.axis("off")
+        self.ax_status.text(0.0, 0.63, "Training", va="center", ha="left", fontsize=9)
+        self.ax_status.text(0.0, 0.44, "Playback", va="center", ha="left", fontsize=9)
+        self.ax_status.text(0.0, 0.25, "Phase", va="center", ha="left", fontsize=9)
+        self.train_bar_bg = plt.Rectangle((0.18, 0.58), 0.74, 0.08, color="0.9")
+        self.train_bar_fg = plt.Rectangle((0.18, 0.58), 0.0, 0.08, color="tab:blue")
+        self.play_bar_bg = plt.Rectangle((0.18, 0.39), 0.74, 0.08, color="0.9")
+        self.play_bar_fg = plt.Rectangle((0.18, 0.39), 0.0, 0.08, color="tab:orange")
+        self.ax_status.add_patch(self.train_bar_bg)
+        self.ax_status.add_patch(self.train_bar_fg)
+        self.ax_status.add_patch(self.play_bar_bg)
+        self.ax_status.add_patch(self.play_bar_fg)
+        self.phase_text = self.ax_status.text(
+            0.18, 0.25, "", va="center", ha="left", family="monospace", fontsize=9
+        )
+
+    def _set_phase(self, phase: str, detail: str):
+        self.current_phase = phase
+        self.phase_detail = detail
 
     def _on_close(self, _event):
         self.closed = True
@@ -937,6 +969,16 @@ class TrainingViewer:
     def _refresh_status(self):
         if self.latest_metrics is None:
             return
+        elapsed = time.perf_counter() - self.start_time
+        train_progress = 0.0 if self.cfg.train_epochs <= 0 else min(
+            1.0, self.epoch / float(self.cfg.train_epochs)
+        )
+        play_progress = 0.0 if len(self.frame_indices) <= 1 else self.frame_ptr / float(
+            len(self.frame_indices) - 1
+        )
+        self.train_bar_fg.set_width(0.74 * train_progress)
+        self.play_bar_fg.set_width(0.74 * play_progress)
+        self.phase_text.set_text(f"{self.current_phase:<10} {self.phase_detail}")
         self.status_text.set_text(
             "\n".join(
                 [
@@ -947,6 +989,10 @@ class TrainingViewer:
                     f"reward         : {self.latest_metrics['reward']: .4f}",
                     f"height error   : {self.latest_metrics['height_error']: .4f}",
                     f"pitch error    : {self.latest_metrics['pitch_error']: .4f}",
+                    f"train progress : {100.0 * train_progress:6.2f} %",
+                    f"playback       : {100.0 * play_progress:6.2f} %",
+                    f"tick count     : {self.train_tick_count:6d}",
+                    f"elapsed        : {elapsed:6.1f} s",
                 ]
             )
         )
@@ -977,6 +1023,8 @@ class TrainingViewer:
             return
         next_ptr = (self.frame_ptr + 1) % len(self.frame_indices)
         self._draw_frame(next_ptr)
+        if self.current_phase == "idle":
+            self._refresh_status()
         self.fig.canvas.draw_idle()
 
     def _on_train_tick(self):
@@ -986,7 +1034,10 @@ class TrainingViewer:
             self.train_timer.stop()
             return
 
+        self.train_tick_count += 1
         latest_metrics = None
+        tick_start = time.perf_counter()
+        self._set_phase("training", "running optimizer step")
         for _ in range(max(1, self.cfg.optim_steps_per_tick)):
             latest_metrics = self.system.train_step(self.features)
             self.epoch += 1
@@ -1000,11 +1051,33 @@ class TrainingViewer:
         refresh_every = self.cfg.vis_every if self.cfg.vis_every > 0 else self.cfg.eval_every
         should_refresh = self.epoch == 1 or self.epoch % max(1, refresh_every) == 0
         if should_refresh:
+            self._set_phase("evaluating", "refreshing rollout for UI")
             rollout, eval_metrics = self.system.evaluate(self.features)
             self._set_rollout(rollout, eval_metrics)
         elif latest_metrics is not None:
             self.latest_metrics = latest_metrics
 
+        self.last_phase_seconds = time.perf_counter() - tick_start
+        if latest_metrics is not None:
+            now = time.perf_counter()
+            if should_refresh or (now - self.last_log_time) >= 2.0:
+                print(
+                    "[trainable_system] "
+                    f"epoch={self.epoch}/{self.cfg.train_epochs} "
+                    f"phase={self.current_phase} "
+                    f"loss={latest_metrics['loss']:.4f} "
+                    f"distance={latest_metrics['distance']:.4f} "
+                    f"vx={latest_metrics['mean_vx']:.4f} "
+                    f"grad={latest_metrics['grad_norm']:.4f} "
+                    f"tick_s={self.last_phase_seconds:.2f}",
+                    flush=True,
+                )
+                self.last_log_time = now
+
+        if self.epoch >= self.cfg.train_epochs:
+            self._set_phase("done", "training complete")
+        else:
+            self._set_phase("idle", "waiting for next timer tick")
         self._refresh_metric_plot()
         self._refresh_status()
         self.fig.canvas.draw_idle()
@@ -1020,8 +1093,14 @@ class TrainingViewer:
 
 def main():
     _require_runtime()
+    print("[trainable_system] building system...", flush=True)
     cfg = Config()
     system = TrainableWalkingSystem(cfg)
+    print(
+        "[trainable_system] system ready "
+        f"(steps={system.num_steps}, exc={system.n_exc}, inh={system.n_inh})",
+        flush=True,
+    )
     features = build_feature_sequence(
         system.num_steps,
         cfg.dt_ms,
@@ -1029,6 +1108,7 @@ def main():
         cfg.target_vy,
         cfg.base_freq_hz,
     )
+    print("[trainable_system] opening training viewer...", flush=True)
     viewer = TrainingViewer(system, features)
     viewer.show()
 
