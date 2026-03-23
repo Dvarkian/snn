@@ -850,6 +850,29 @@ def prepare_spike_histograms_for_times(
     return histograms, domain
 
 
+def _build_snapshot_payload(system: TrainableWalkingSystem, rollout, metrics):
+    ts_ms = np.asarray(rollout["ts"], dtype=float)
+    frame_stride = max(1, int(round((1000.0 / system.cfg.animation_fps) / system.cfg.dt_ms)))
+    frame_indices = np.arange(0, len(ts_ms), frame_stride, dtype=int)
+    if len(frame_indices) == 0 or frame_indices[-1] != len(ts_ms) - 1:
+        frame_indices = np.append(frame_indices, len(ts_ms) - 1)
+    frame_times = ts_ms[frame_indices]
+    runner = RolloutRunner(mon=rollout)
+    histograms, _ = prepare_spike_histograms_for_times(
+        system,
+        runner,
+        frame_times,
+        system.cfg.window_size_ms,
+    )
+    return {
+        "rollout": rollout,
+        "metrics": metrics,
+        "frame_indices": frame_indices.astype(np.int32),
+        "frame_times": frame_times.astype(np.float32),
+        "histograms": histograms.astype(np.float32),
+    }
+
+
 def _training_worker(
     cfg: Config,
     train_features: np.ndarray,
@@ -893,13 +916,13 @@ def _training_worker(
             vis_features,
             progress_label="initial rollout",
         )
+        snapshot_payload = _build_snapshot_payload(system, rollout, metrics)
         _queue_put_latest(
             message_queue,
             {
                 "type": "snapshot",
                 "epoch": 0,
-                "rollout": rollout,
-                "metrics": metrics,
+                **snapshot_payload,
                 "phase": "idle",
                 "detail": "ready to train",
             },
@@ -943,13 +966,13 @@ def _training_worker(
                     vis_features,
                     progress_label="refresh rollout",
                 )
+                snapshot_payload = _build_snapshot_payload(system, rollout, eval_metrics)
                 _queue_put_latest(
                     message_queue,
                     {
                         "type": "snapshot",
                         "epoch": epoch,
-                        "rollout": rollout,
-                        "metrics": eval_metrics,
+                        **snapshot_payload,
                         "phase": "idle",
                         "detail": "snapshot ready",
                     },
@@ -1168,7 +1191,13 @@ class TrainingViewer:
 
             if msg_type == "snapshot":
                 self._record_metrics(int(message["epoch"]), message["metrics"])
-                self._set_rollout(message["rollout"], message["metrics"])
+                self._set_rollout(
+                    message["rollout"],
+                    message["metrics"],
+                    frame_indices=message.get("frame_indices"),
+                    frame_times=message.get("frame_times"),
+                    histograms=message.get("histograms"),
+                )
                 continue
 
             if msg_type == "done":
@@ -1198,27 +1227,30 @@ class TrainingViewer:
     def _segment_dir(self, joint_angle: float) -> np.ndarray:
         return np.array([np.sin(joint_angle), -np.cos(joint_angle)], dtype=float)
 
-    def _set_rollout(self, rollout, metrics):
+    def _set_rollout(self, rollout, metrics, frame_indices=None, frame_times=None, histograms=None):
         self.latest_rollout = rollout
         self.latest_metrics = metrics
 
-        ts_ms = np.asarray(rollout["ts"], dtype=float)
-        frame_stride = max(1, int(round((1000.0 / self.cfg.animation_fps) / self.cfg.dt_ms)))
-        frame_indices = np.arange(0, len(ts_ms), frame_stride, dtype=int)
-        if len(frame_indices) == 0 or frame_indices[-1] != len(ts_ms) - 1:
-            frame_indices = np.append(frame_indices, len(ts_ms) - 1)
-        self.frame_indices = frame_indices
-        self.frame_times = ts_ms[frame_indices]
+        if frame_indices is None or frame_times is None:
+            ts_ms = np.asarray(rollout["ts"], dtype=float)
+            frame_stride = max(1, int(round((1000.0 / self.cfg.animation_fps) / self.cfg.dt_ms)))
+            frame_indices = np.arange(0, len(ts_ms), frame_stride, dtype=int)
+            if len(frame_indices) == 0 or frame_indices[-1] != len(ts_ms) - 1:
+                frame_indices = np.append(frame_indices, len(ts_ms) - 1)
+            frame_times = ts_ms[frame_indices]
+        self.frame_indices = np.asarray(frame_indices, dtype=int)
+        self.frame_times = np.asarray(frame_times, dtype=float)
         self.frame_ptr = 0
 
-        runner = RolloutRunner(mon=rollout)
-        self.histograms, _ = prepare_spike_histograms_for_times(
-            self.system,
-            runner,
-            self.frame_times,
-            self.cfg.window_size_ms,
-            progress_label="preparing spike maps",
-        )
+        if histograms is None:
+            runner = RolloutRunner(mon=rollout)
+            histograms, _ = prepare_spike_histograms_for_times(
+                self.system,
+                runner,
+                self.frame_times,
+                self.cfg.window_size_ms,
+            )
+        self.histograms = np.asarray(histograms, dtype=float)
         vmax = max(1.0, float(np.max(self.histograms)))
         self.net_im.set_clim(0.0, vmax)
 
