@@ -231,6 +231,41 @@ def _python_metrics(metrics: Dict[str, Any]) -> Dict[str, float]:
     return {key: float(np.asarray(value)) for key, value in metrics.items()}
 
 
+class TerminalProgressBar:
+    def __init__(self, total: int, label: str, width: int = 28):
+        self.total = max(1, int(total))
+        self.label = label
+        self.width = width
+        self.current = 0
+        self.start = time.perf_counter()
+        self._draw(0)
+
+    def _draw(self, current: int):
+        current = int(np.clip(current, 0, self.total))
+        frac = current / float(self.total)
+        filled = int(round(self.width * frac))
+        bar = "#" * filled + "-" * (self.width - filled)
+        elapsed = time.perf_counter() - self.start
+        print(
+            f"\r[trainable_system] {self.label:<24} [{bar}] "
+            f"{100.0 * frac:6.2f}% ({current:>4d}/{self.total:<4d}) "
+            f"{elapsed:6.1f}s",
+            end="",
+            flush=True,
+        )
+
+    def update(self, current: int):
+        if current <= self.current and current < self.total:
+            return
+        self.current = min(int(current), self.total)
+        self._draw(self.current)
+
+    def finish(self):
+        self.current = self.total
+        self._draw(self.total)
+        print("", flush=True)
+
+
 class TrainableWalkingSystem:
     def __init__(self, cfg: Config):
         _require_runtime()
@@ -508,9 +543,14 @@ class TrainableWalkingSystem:
             )
         return features
 
-    def _simulate(self, params, features):
+    def _simulate(self, params, features, progress_label: Optional[str] = None):
         state = self._initial_walker_state()
         ctrl_state = self._controller_initial_state()
+        progress = None
+        progress_stride = None
+        if progress_label:
+            progress = TerminalProgressBar(self.num_steps, progress_label)
+            progress_stride = max(1, self.num_steps // 40)
 
         pos = []
         vel = []
@@ -549,8 +589,12 @@ class TrainableWalkingSystem:
             action_hist.append(action)
             spike_hist.append(ctrl_state["spike"])
             filt_hist.append(ctrl_state["filt"])
+            if progress is not None and ((t + 1) % progress_stride == 0 or (t + 1) == self.num_steps):
+                progress.update(t + 1)
 
         spikes = jnp.stack(spike_hist, axis=0)
+        if progress is not None:
+            progress.finish()
         return {
             "ts": jnp.arange(self.num_steps, dtype=jnp.float32) * self.cfg.dt_ms,
             "pos": jnp.stack(pos, axis=0),
@@ -660,6 +704,14 @@ class TrainableWalkingSystem:
         _, metrics = self._metrics_from_rollout(rollout, features)
         return _tree_to_numpy(rollout), _python_metrics(metrics)
 
+    def evaluate_with_progress(
+        self, features: Optional[np.ndarray] = None, progress_label: str = "rollout"
+    ):
+        features = self._coerce_features(features)
+        rollout = self._simulate(self.params, features, progress_label=progress_label)
+        _, metrics = self._metrics_from_rollout(rollout, features)
+        return _tree_to_numpy(rollout), _python_metrics(metrics)
+
 
 def collect_rollout(
     system: TrainableWalkingSystem, features: Optional[np.ndarray] = None
@@ -673,6 +725,7 @@ def prepare_spike_histograms_for_times(
     runner: RolloutRunner,
     frame_times: np.ndarray,
     window_size_ms: float,
+    progress_label: Optional[str] = None,
 ):
     ts = np.asarray(runner.mon["ts"], dtype=float)
     e_spikes = np.asarray(runner.mon["E.spike"], dtype=float)
@@ -683,6 +736,11 @@ def prepare_spike_histograms_for_times(
     x_edges = np.linspace(0.0, domain[0], grid_size[0] + 1)
     y_edges = np.linspace(0.0, domain[1], grid_size[1] + 1)
     histograms = np.zeros((len(frame_times), grid_size[0], grid_size[1]), dtype=float)
+    progress = None
+    progress_stride = None
+    if progress_label:
+        progress = TerminalProgressBar(len(frame_times), progress_label)
+        progress_stride = max(1, len(frame_times) // 40)
 
     for i, frame_t in enumerate(frame_times):
         win_start_t = frame_t - window_size_ms
@@ -696,7 +754,11 @@ def prepare_spike_histograms_for_times(
             weights=spike_counts,
         )
         histograms[i] = hist
+        if progress is not None and ((i + 1) % progress_stride == 0 or (i + 1) == len(frame_times)):
+            progress.update(i + 1)
 
+    if progress is not None:
+        progress.finish()
     return histograms, domain
 
 
@@ -869,6 +931,7 @@ class TrainingViewer:
             runner,
             self.frame_times,
             self.cfg.window_size_ms,
+            progress_label="preparing spike maps",
         )
         vmax = max(1.0, float(np.max(self.histograms)))
         self.net_im.set_clim(0.0, vmax)
@@ -1053,7 +1116,10 @@ class TrainingViewer:
                 )
                 self._bootstrap_started = True
             bootstrap_start = time.perf_counter()
-            rollout, metrics = self.system.evaluate(self.features)
+            rollout, metrics = self.system.evaluate_with_progress(
+                self.features,
+                progress_label="initial rollout",
+            )
             self.last_phase_seconds = time.perf_counter() - bootstrap_start
             self._set_rollout(rollout, metrics)
             self.bootstrap_pending = False
@@ -1089,7 +1155,10 @@ class TrainingViewer:
         should_refresh = self.epoch == 1 or self.epoch % max(1, refresh_every) == 0
         if should_refresh:
             self._set_phase("evaluating", "refreshing rollout for UI")
-            rollout, eval_metrics = self.system.evaluate(self.features)
+            rollout, eval_metrics = self.system.evaluate_with_progress(
+                self.features,
+                progress_label="refresh rollout",
+            )
             self._set_rollout(rollout, eval_metrics)
         elif latest_metrics is not None:
             self.latest_metrics = latest_metrics
