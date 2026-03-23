@@ -117,9 +117,9 @@ class Config:
     # Task / training.
     target_vx: float = 0.40
     target_vy: float = 0.0
-    episode_ms: float = 1500.0
+    episode_ms: float = 7500.0
     dt_ms: float = 4.0
-    train_epochs: int = 300
+    train_epochs: Optional[int] = None
     learning_rate: float = 2e-3
     adam_beta1: float = 0.9
     adam_beta2: float = 0.999
@@ -135,6 +135,8 @@ class Config:
     es_population: int = 4
     es_noise_std: float = 0.03
     es_reward_scale: float = 1.0
+    camera_width: float = 2.4
+    camera_height_pad: float = 0.18
 
     # Reward shaping.
     reward_distance: float = 6.0
@@ -818,7 +820,7 @@ def _training_worker(cfg: Config, features: np.ndarray, message_queue, stop_even
         )
 
         epoch = 0
-        while epoch < cfg.train_epochs and not stop_event.is_set():
+        while not stop_event.is_set():
             _queue_put_latest(
                 message_queue,
                 {
@@ -841,7 +843,7 @@ def _training_worker(cfg: Config, features: np.ndarray, message_queue, stop_even
                 },
             )
 
-            should_refresh = epoch == 1 or epoch % max(1, refresh_every) == 0 or epoch >= cfg.train_epochs
+            should_refresh = epoch == 1 or epoch % max(1, refresh_every) == 0
             if should_refresh and not stop_event.is_set():
                 _queue_put_latest(
                     message_queue,
@@ -862,7 +864,7 @@ def _training_worker(cfg: Config, features: np.ndarray, message_queue, stop_even
                         "epoch": epoch,
                         "rollout": rollout,
                         "metrics": eval_metrics,
-                        "phase": "idle" if epoch < cfg.train_epochs else "done",
+                        "phase": "idle",
                         "detail": "snapshot ready",
                     },
                 )
@@ -873,7 +875,7 @@ def _training_worker(cfg: Config, features: np.ndarray, message_queue, stop_even
                 "type": "done",
                 "epoch": epoch,
                 "phase": "done",
-                "detail": "training complete",
+                "detail": "training stopped",
             },
         )
     except Exception as exc:  # pragma: no cover - worker-side runtime path.
@@ -924,6 +926,8 @@ class TrainingViewer:
         self.start_time = time.perf_counter()
         self.last_log_time = self.start_time
         self.worker_done = False
+        self.robot_y_limits = (0.0, 1.0)
+        self.camera_half_width = max(0.5, 0.5 * self.cfg.camera_width)
 
         self.fig = plt.figure(figsize=(14, 8))
         gs = self.fig.add_gridspec(2, 2, width_ratios=[1.15, 1.0], hspace=0.30, wspace=0.28)
@@ -1078,7 +1082,7 @@ class TrainingViewer:
             if msg_type == "done":
                 self.worker_done = True
                 self.epoch = max(self.epoch, int(message.get("epoch", self.epoch)))
-                self._set_phase("done", message.get("detail", "training complete"))
+                self._set_phase("done", message.get("detail", "training stopped"))
                 continue
 
             if msg_type == "error":
@@ -1128,8 +1132,6 @@ class TrainingViewer:
 
         pos = np.asarray(rollout["pos"], dtype=float)
         foot_pos = np.asarray(rollout["foot_pos"], dtype=float)
-        min_x = float(min(np.min(pos[:, 0]) - self.cfg.body_length, np.min(foot_pos[:, :, 0]) - 0.1))
-        max_x = float(max(np.max(pos[:, 0]) + self.cfg.body_length, np.max(foot_pos[:, :, 0]) + 0.1))
         min_y = float(
             min(
                 np.min(pos[:, 1]) - self.cfg.body_height,
@@ -1144,8 +1146,13 @@ class TrainingViewer:
                 self.cfg.height_target + 0.08,
             )
         )
-        self.ax_robot.set_xlim(min_x, max_x)
-        self.ax_robot.set_ylim(min_y, max_y)
+        self.robot_y_limits = (min_y, max_y + self.cfg.camera_height_pad)
+        self.camera_half_width = max(
+            0.5,
+            0.5 * self.cfg.camera_width,
+            self.cfg.body_length + self.cfg.thigh_length + self.cfg.shank_length + 0.2,
+        )
+        self.ax_robot.set_ylim(*self.robot_y_limits)
         self.force_scale = 0.35 * self.cfg.body_length / max(
             1.0, float(np.max(np.linalg.norm(np.asarray(rollout["force"], dtype=float), axis=1)))
         )
@@ -1213,6 +1220,7 @@ class TrainingViewer:
             [p[0], p[0] + f[0] * self.force_scale],
             [p[1], p[1] + f[1] * self.force_scale],
         )
+        self.ax_robot.set_xlim(p[0] - self.camera_half_width, p[0] + self.camera_half_width)
         self.ax_robot.set_title(
             "Walker Rollout | "
             f"epoch={self.epoch} | x={p[0]:.3f} y={p[1]:.3f} pitch={theta:.3f}"
@@ -1220,9 +1228,7 @@ class TrainingViewer:
 
     def _refresh_status(self):
         elapsed = time.perf_counter() - self.start_time
-        train_progress = 0.0 if self.cfg.train_epochs <= 0 else min(
-            1.0, self.epoch / float(self.cfg.train_epochs)
-        )
+        train_progress = 0.15 + 0.85 * (0.5 + 0.5 * np.sin(0.2 * self.train_tick_count))
         play_progress = 0.0 if len(self.frame_indices) <= 1 else self.frame_ptr / float(
             len(self.frame_indices) - 1
         )
@@ -1251,9 +1257,9 @@ class TrainingViewer:
         self.status_text.set_text(
             "\n".join(
                 [
-                    f"epoch          : {self.epoch:4d} / {self.cfg.train_epochs}",
+                    f"epoch          : {self.epoch:4d} (running until stopped)",
                     *metric_lines,
-                    f"train progress : {100.0 * train_progress:6.2f} %",
+                    f"train status   : active ({100.0 * train_progress:6.2f} % pulse)",
                     f"playback       : {100.0 * play_progress:6.2f} %",
                     f"tick count     : {self.train_tick_count:6d}",
                     f"elapsed        : {elapsed:6.1f} s",
@@ -1308,7 +1314,7 @@ class TrainingViewer:
             if self.latest_metrics is not None and (now - self.last_log_time) >= 0.5:
                 print(
                     "[trainable_system] "
-                    f"epoch={self.epoch}/{self.cfg.train_epochs} "
+                    f"epoch={self.epoch} "
                     f"phase={self.current_phase} "
                     f"loss={self.latest_metrics['loss']:.4f} "
                     f"distance={self.latest_metrics['distance']:.4f} "
