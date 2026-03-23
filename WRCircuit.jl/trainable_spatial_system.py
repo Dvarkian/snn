@@ -499,6 +499,12 @@ class TrainableWalkingSystem:
         }
 
     def _make_physics(self):
+        initial_state = self.make_initial_state(
+            self.cfg,
+            hip_offsets=np.asarray(self.cfg.hip_offsets, dtype=float),
+            knee_offsets=np.asarray(self.cfg.knee_offsets, dtype=float),
+        )
+        return self.PymunkPassiveWalker(self.cfg, initial_state)
 
     def _controller_step(self, params, ctrl_state, obs):
         # 1. Compute input current from observations.
