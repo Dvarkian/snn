@@ -294,10 +294,17 @@ _patch_csrlinear_update()
 
 @dataclass
 class Config:
-    # Spatial model parameters (same defaults as run_simulation.py)
-    rho: int = 10000
+    # Spatial model parameters.
+    # The training dashboard uses lighter defaults than run_simulation.py so
+    # initialization and BPTT stay interactive on CPU.
+    rho: int = 900
     dx: float = 1.0
     seed: int = 42
+    gamma: int = 4
+    K_ee: int = 80
+    K_ei: int = 100
+    K_ie: int = 70
+    K_ii: int = 80
 
     # Robot parameters
     n_legs: int = 2
@@ -333,7 +340,8 @@ class Config:
 
     # Simulation parameters
     dt_ms: float = 1.0
-    episode_ms: float = 2000.0
+    episode_ms: float = 300.0
+    rollout_ms: Optional[float] = 1200.0
     base_freq_hz: float = 1.5
     target_vx: float = 0.4
     target_vy: float = 0.0
@@ -352,20 +360,20 @@ class Config:
 
     # Input injection
     feature_dim: int = 7  # [1, target_vx, target_vy, sin, cos, sin2, cos2]
-    input_rank: int = 8
+    input_rank: int = 6
     input_scale: float = 0.6
     input_init_scale: float = 0.05
 
     # Readout
     out_per_leg: int = 2  # hip target angle, knee target angle
-    readout_rank: Optional[int] = 128  # None means full readout
+    readout_rank: Optional[int] = 64  # None means full readout
     readout_init_scale: float = 0.02
     rate_decay: float = 0.95
 
     # Training
-    train_epochs: int = 80
+    train_epochs: int = 60
     lr: float = 3e-3
-    eval_every: int = 10
+    eval_every: int = 5
     train_core: bool = False  # if True, also train core synaptic weights (heavy)
     vis_every: int = 5  # visualize progress every N epochs (0 disables)
 
@@ -440,6 +448,21 @@ def build_feature_sequence(
         axis=1,
     )
     return feats
+
+
+def build_controller_features(
+    cfg: Config, duration_ms: Optional[float] = None
+) -> bm.Array:
+    if duration_ms is None:
+        duration_ms = cfg.episode_ms
+    num_steps = max(1, int(round(float(duration_ms) / float(cfg.dt_ms))))
+    return build_feature_sequence(
+        num_steps,
+        cfg.dt_ms,
+        cfg.target_vx,
+        cfg.target_vy,
+        cfg.base_freq_hz,
+    )
 
 
 def global_norm(grads: Dict[str, bm.Array]) -> bm.Array:
@@ -615,8 +638,19 @@ class TrainableWalkingSystem(bp.DynamicalSystem):
         self.pymunk_physics = PymunkWalkerPhysicsAdapter(cfg)
         self.physics_backend = "differentiable"
 
-        # Core SNN (same model as run_simulation.py)
-        self.core = Spatial(key=cfg.seed, rho=cfg.rho, dx=cfg.dx)
+        # Core SNN. This is still the same Spatial model family used in
+        # run_simulation.py, but with training-oriented connectivity defaults
+        # taken from Config.
+        self.core = Spatial(
+            key=cfg.seed,
+            rho=cfg.rho,
+            dx=cfg.dx,
+            gamma=cfg.gamma,
+            K_ee=cfg.K_ee,
+            K_ei=cfg.K_ei,
+            K_ie=cfg.K_ie,
+            K_ii=cfg.K_ii,
+        )
 
         # Fixed spatial input patterns
         self.E_patterns = bm.asarray(
@@ -945,7 +979,8 @@ class RolloutSnapshot:
     def duration_ms(self) -> float:
         if self.ts_ms.size < 2:
             return 1.0
-        return max(1.0, float(self.ts_ms[-1] - self.ts_ms[0]))
+        step_ms = float(np.median(np.diff(self.ts_ms)))
+        return max(1.0, float(self.ts_ms[-1] - self.ts_ms[0]) + step_ms)
 
 
 class DashboardState:
@@ -959,7 +994,7 @@ class DashboardState:
             "timestamp": [],
         }
         self.history_version = 0
-        self.rollout: Optional[RolloutSnapshot] = None
+        self.rollouts: List[RolloutSnapshot] = []
         self.rollout_version = 0
         self.current_epoch = 0
         self.status = "Waiting for training worker..."
@@ -988,7 +1023,10 @@ class DashboardState:
 
     def publish_rollout(self, rollout: RolloutSnapshot):
         with self._lock:
-            self.rollout = rollout
+            if self.rollouts and self.rollouts[-1].epoch == rollout.epoch:
+                self.rollouts[-1] = rollout
+            else:
+                self.rollouts.append(rollout)
             self.rollout_version += 1
             self.current_epoch = max(self.current_epoch, rollout.epoch)
             self.status = f"Showing rollout from epoch {rollout.epoch}"
@@ -1015,7 +1053,8 @@ class DashboardState:
             return {
                 "history": history,
                 "history_version": self.history_version,
-                "rollout": self.rollout,
+                "rollouts": tuple(self.rollouts),
+                "rollout": self.rollouts[-1] if self.rollouts else None,
                 "rollout_version": self.rollout_version,
                 "epoch": self.current_epoch,
                 "status": self.status,
@@ -1029,11 +1068,14 @@ def train_system(cfg: Config, dashboard_state: Optional[DashboardState] = None):
     system = TrainableWalkingSystem(cfg)
     enable_training_mode(system)
 
-    num_steps = int(cfg.episode_ms / cfg.dt_ms)
-    features = build_feature_sequence(
-        num_steps, cfg.dt_ms, cfg.target_vx, cfg.target_vy, cfg.base_freq_hz
+    features = build_controller_features(cfg, cfg.episode_ms)
+    rollout_ms = cfg.rollout_ms if cfg.rollout_ms is not None else cfg.episode_ms
+    rollout_features = (
+        features
+        if math.isclose(float(rollout_ms), float(cfg.episode_ms))
+        else build_controller_features(cfg, rollout_ms)
     )
-    indices = bm.arange(num_steps)
+    indices = bm.arange(features.shape[0])
 
     def loss_fn():
         system.set_physics_backend("differentiable")
@@ -1054,7 +1096,9 @@ def train_system(cfg: Config, dashboard_state: Optional[DashboardState] = None):
 
     if dashboard_state is not None:
         dashboard_state.set_status("Preparing initial rollout...")
-        initial_snapshot = build_rollout_snapshot(system, features, cfg, epoch=0)
+        initial_snapshot = build_rollout_snapshot(
+            system, rollout_features, cfg, epoch=0
+        )
         history["forward"].append((0, initial_snapshot.forward_end))
         dashboard_state.append_forward(0, initial_snapshot.forward_end)
         dashboard_state.publish_rollout(initial_snapshot)
@@ -1094,13 +1138,17 @@ def train_system(cfg: Config, dashboard_state: Optional[DashboardState] = None):
             dashboard_state.set_status(
                 f"Collecting rollout for epoch {epoch + 1}/{cfg.train_epochs}..."
             )
-            snapshot = build_rollout_snapshot(system, features, cfg, epoch=epoch + 1)
+            snapshot = build_rollout_snapshot(
+                system, rollout_features, cfg, epoch=epoch + 1
+            )
 
         if eval_due:
             if snapshot is not None:
                 forward = snapshot.forward_end
             else:
-                forward = float(bm.as_numpy(evaluate_forward(system, features, cfg)))
+                forward = float(
+                    bm.as_numpy(evaluate_forward(system, rollout_features, cfg))
+                )
             history["forward"].append((epoch + 1, forward))
             if dashboard_state is not None:
                 dashboard_state.append_forward(epoch + 1, forward)
@@ -1109,7 +1157,7 @@ def train_system(cfg: Config, dashboard_state: Optional[DashboardState] = None):
                 f"Forward {forward:.3f} | GradNorm {grad_value:.4f}"
             )
 
-        if snapshot is not None and (snapshot_due or final_due):
+        if snapshot is not None and dashboard_state is not None:
             dashboard_state.publish_rollout(snapshot)
 
     return system, features, history
@@ -1131,11 +1179,13 @@ class LiveDashboard:
     def __init__(self, cfg: Config, state: DashboardState):
         self.cfg = cfg
         self.state = state
+        self.rollout_sequence: List[RolloutSnapshot] = []
+        self.current_rollout_idx = -1
         self.current_rollout: Optional[RolloutSnapshot] = None
         self.last_history_version = -1
         self.last_rollout_version = -1
         self.last_title = ""
-        self.playback_started_at = time.perf_counter()
+        self.clip_started_at = time.perf_counter()
 
         plt.ion()
 
@@ -1313,12 +1363,63 @@ class LiveDashboard:
         idx = int(np.searchsorted(times, target_time, side="right") - 1)
         return int(np.clip(idx, 0, len(times) - 1))
 
+    def _set_current_rollout_idx(self, idx: int, reset_clock: bool) -> None:
+        if not self.rollout_sequence:
+            self.current_rollout_idx = -1
+            self.current_rollout = None
+            return
+
+        idx = int(idx) % len(self.rollout_sequence)
+        rollout = self.rollout_sequence[idx]
+        rollout_changed = (
+            self.current_rollout_idx != idx or self.current_rollout is not rollout
+        )
+        self.current_rollout_idx = idx
+        self.current_rollout = rollout
+
+        if rollout_changed:
+            self._apply_rollout(rollout)
+        if reset_clock:
+            self.clip_started_at = time.perf_counter()
+
+    def _apply_rollouts(self, rollouts: Tuple[RolloutSnapshot, ...]) -> None:
+        previous_epoch = self.current_rollout.epoch if self.current_rollout else None
+        self.rollout_sequence = list(rollouts)
+
+        if not self.rollout_sequence:
+            self.current_rollout_idx = -1
+            self.current_rollout = None
+            return
+
+        if previous_epoch is None:
+            self._set_current_rollout_idx(0, reset_clock=True)
+            return
+
+        for idx, rollout in enumerate(self.rollout_sequence):
+            if rollout.epoch == previous_epoch:
+                self._set_current_rollout_idx(idx, reset_clock=False)
+                return
+
+        self._set_current_rollout_idx(len(self.rollout_sequence) - 1, reset_clock=True)
+
+    def _advance_rollout_if_needed(self) -> None:
+        if self.current_rollout is None or not self.rollout_sequence:
+            return
+
+        elapsed_ms = (time.perf_counter() - self.clip_started_at) * 1000.0
+        while elapsed_ms >= self.current_rollout.duration_ms:
+            elapsed_ms -= self.current_rollout.duration_ms
+            next_idx = (self.current_rollout_idx + 1) % len(self.rollout_sequence)
+            self._set_current_rollout_idx(next_idx, reset_clock=False)
+            self.clip_started_at = time.perf_counter() - elapsed_ms / 1000.0
+
     def _playback_time_ms(self) -> float:
         rollout = self.current_rollout
         if rollout is None:
             return 0.0
-        elapsed_ms = (time.perf_counter() - self.playback_started_at) * 1000.0
-        return float(rollout.ts_ms[0]) + (elapsed_ms % rollout.duration_ms)
+        elapsed_ms = (time.perf_counter() - self.clip_started_at) * 1000.0
+        span_ms = max(0.0, float(rollout.ts_ms[-1] - rollout.ts_ms[0]))
+        return float(rollout.ts_ms[0]) + min(elapsed_ms, span_ms)
 
     def _apply_history(self, view):
         history = view["history"]
@@ -1347,9 +1448,6 @@ class LiveDashboard:
         self.training_text.set_text(" | ".join(latest_bits))
 
     def _apply_rollout(self, rollout: RolloutSnapshot):
-        self.current_rollout = rollout
-        self.playback_started_at = time.perf_counter()
-
         body_x = rollout.pos[:, 0]
         body_y = rollout.pos[:, 1]
         foot_x = rollout.foot_pos[:, :, 0].reshape(-1)
@@ -1439,12 +1537,14 @@ class LiveDashboard:
         )
 
         t_rel = current_time_ms - float(rollout.ts_ms[0])
+        clip_label = f"snapshot {self.current_rollout_idx + 1}/{len(self.rollout_sequence)}"
         self.ax_robot.set_title(
-            f"Rigid Walker | epoch {rollout.epoch} | t={t_rel:.0f} ms | "
+            f"Rigid Walker | {clip_label} | epoch {rollout.epoch} | t={t_rel:.0f} ms | "
             f"x={x:.3f} y={y:.3f} pitch={theta:.3f}"
         )
 
     def _update_playback(self):
+        self._advance_rollout_if_needed()
         rollout = self.current_rollout
         if rollout is None:
             return
@@ -1457,7 +1557,8 @@ class LiveDashboard:
         self.im.set_data(rollout.heatmaps[heatmap_idx].T)
         t_rel = current_time_ms - float(rollout.ts_ms[0])
         self.ax_heatmap.set_title(
-            f"Spatial Firing | epoch {rollout.epoch} | t={t_rel:.0f} ms"
+            f"Spatial Firing | snapshot {self.current_rollout_idx + 1}/{len(self.rollout_sequence)} | "
+            f"epoch {rollout.epoch} | t={t_rel:.0f} ms"
         )
 
         cursor_x = float(rollout.ts_ms[state_idx])
@@ -1475,11 +1576,8 @@ class LiveDashboard:
             self._apply_history(view)
             self.last_history_version = view["history_version"]
 
-        if (
-            view["rollout"] is not None
-            and view["rollout_version"] != self.last_rollout_version
-        ):
-            self._apply_rollout(view["rollout"])
+        if view["rollouts"] and view["rollout_version"] != self.last_rollout_version:
+            self._apply_rollouts(view["rollouts"])
             self.last_rollout_version = view["rollout_version"]
 
         self._update_playback()
@@ -1496,6 +1594,7 @@ class LiveDashboard:
             self.last_title = title
 
         self.fig.canvas.draw_idle()
+        self.fig.canvas.flush_events()
         return True
 
 
@@ -1759,9 +1858,8 @@ def animate_robot(
         for j in range(cfg.n_legs):
             hip = hip_pos[j]
             thigh_abs = theta + float(hip_angle[i, j])
-            shank_abs = thigh_abs + float(knee_angle[i, j])
             knee_pos = hip + cfg.thigh_length * segment_dir(thigh_abs)
-            foot = knee_pos + cfg.shank_length * segment_dir(shank_abs)
+            foot = np.asarray(foot_pos[i, j], dtype=float)
 
             thighs[j].set_data([hip[0], knee_pos[0]], [hip[1], knee_pos[1]])
             shanks[j].set_data([knee_pos[0], foot[0]], [knee_pos[1], foot[1]])
