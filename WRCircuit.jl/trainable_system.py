@@ -32,6 +32,7 @@ def _ensure_writable_runtime_dirs():
 _ensure_writable_runtime_dirs()
 
 import matplotlib.pyplot as plt
+from matplotlib.collections import LineCollection
 
 
 _JAX_IMPORT_ERROR = None
@@ -1004,7 +1005,6 @@ class TrainingViewer:
         self.frame_indices = np.asarray([0], dtype=int)
         self.frame_times = np.asarray([0.0], dtype=float)
         self.frame_ptr = 0
-        self.histograms = np.zeros((1, self.system.exc_side, self.system.exc_side), dtype=float)
         self.current_phase = "starting"
         self.phase_detail = "initializing viewer"
         self.last_phase_seconds = 0.0
@@ -1018,36 +1018,21 @@ class TrainingViewer:
             self.cfg.body_length + self.cfg.thigh_length + self.cfg.shank_length + 0.2,
         )
         self.latest_params = _tree_to_numpy(system.params)
+        self.filtered_node_scale = 1.0
+        self.adapt_node_scale = 1.0
+        self.max_recurrent_edges = 420
+        self.max_input_edges_per_channel = 5
+        self.max_output_edges_per_command = 14
 
-        self.fig = plt.figure(figsize=(19, 10))
-        outer = self.fig.add_gridspec(
-            2,
-            3,
-            width_ratios=[1.15, 1.15, 0.95],
-            height_ratios=[1.0, 1.0],
-            hspace=0.24,
-            wspace=0.26,
-        )
-        left = outer[:, 0].subgridspec(3, 2, height_ratios=[1.0, 1.0, 0.95], hspace=0.38, wspace=0.30)
-        weights = outer[:, 1].subgridspec(3, 1, height_ratios=[1.0, 1.2, 0.95], hspace=0.38)
-        bottom_weights = weights[2, 0].subgridspec(1, 2, wspace=0.35)
-        right = outer[:, 2].subgridspec(3, 1, height_ratios=[1.6, 0.9, 0.7], hspace=0.35)
-        self.ax_spike = self.fig.add_subplot(left[0, 0])
-        self.ax_membrane = self.fig.add_subplot(left[0, 1])
-        self.ax_filtered = self.fig.add_subplot(left[1, 0])
-        self.ax_adapt = self.fig.add_subplot(left[1, 1])
-        self.ax_obs = self.fig.add_subplot(left[2, 0])
-        self.ax_action = self.fig.add_subplot(left[2, 1])
-        self.ax_w_in = self.fig.add_subplot(weights[0, 0])
-        self.ax_w_rec = self.fig.add_subplot(weights[1, 0])
-        self.ax_w_out = self.fig.add_subplot(bottom_weights[0, 0])
-        self.ax_rec_summary = self.fig.add_subplot(bottom_weights[0, 1])
+        self.fig = plt.figure(figsize=(18, 10))
+        outer = self.fig.add_gridspec(1, 2, width_ratios=[1.8, 0.95], wspace=0.24)
+        self.ax_net = self.fig.add_subplot(outer[0, 0])
+        right = outer[0, 1].subgridspec(3, 1, height_ratios=[1.6, 0.9, 0.7], hspace=0.35)
         self.ax_robot = self.fig.add_subplot(right[0, 0])
         self.ax_metric = self.fig.add_subplot(right[1, 0])
         self.ax_status = self.fig.add_subplot(right[2, 0])
 
         self._init_network_panel()
-        self._init_weight_panel()
         self._init_robot_panel()
         self._init_metric_panel()
 
@@ -1076,137 +1061,177 @@ class TrainingViewer:
         self.train_timer.add_callback(self._on_train_tick)
 
     def _init_network_panel(self):
-        zero_grid = np.zeros((self.system.exc_side, self.system.exc_side), dtype=float)
-        self.spike_im = self.ax_spike.imshow(
-            zero_grid.T,
-            origin="lower",
-            extent=[0.0, self.cfg.controller_dx_mm, 0.0, self.cfg.controller_dx_mm],
-            interpolation="nearest",
-            aspect="equal",
-            cmap="hot",
-            vmin=0.0,
-            vmax=1.0,
+        self.ax_net.set_facecolor("#07111f")
+        self.ax_net.set_xlim(0.0, 1.0)
+        self.ax_net.set_ylim(0.0, 1.0)
+        self.ax_net.set_aspect("equal", adjustable="box")
+        self.ax_net.set_box_aspect(1.0)
+        self.ax_net.set_xticks([])
+        self.ax_net.set_yticks([])
+        for spine in self.ax_net.spines.values():
+            spine.set_visible(False)
+        self.ax_net.set_title("Spatial SNN Controller", loc="left", color="#e8eef7", fontsize=14, pad=10)
+
+        self.ax_net.add_patch(
+            plt.Rectangle(
+                (0.24, 0.08),
+                0.52,
+                0.84,
+                facecolor="#0f1e31",
+                edgecolor="#284661",
+                lw=1.4,
+                alpha=0.96,
+                zorder=0,
+            )
         )
-        self.membrane_im = self.ax_membrane.imshow(
-            zero_grid.T,
-            origin="lower",
-            extent=[0.0, self.cfg.controller_dx_mm, 0.0, self.cfg.controller_dx_mm],
-            interpolation="nearest",
-            aspect="equal",
+        self.ax_net.text(0.08, 0.96, "Inputs", ha="center", va="top", color="#91a7c2", fontsize=10)
+        self.ax_net.text(0.50, 0.96, "Recurrent Sheet", ha="center", va="top", color="#91a7c2", fontsize=10)
+        self.ax_net.text(0.92, 0.96, "Outputs", ha="center", va="top", color="#91a7c2", fontsize=10)
+
+        self.input_node_positions = np.column_stack(
+            [
+                np.full((self.system.obs_size,), 0.08, dtype=float),
+                np.linspace(0.90, 0.10, self.system.obs_size, dtype=float),
+            ]
+        )
+        self.output_node_positions = np.column_stack(
+            [
+                np.full((self.system.action_size,), 0.92, dtype=float),
+                np.linspace(0.66, 0.34, self.system.action_size, dtype=float),
+            ]
+        )
+        self.exc_canvas_positions = self._controller_to_canvas(self.system.exc_positions)
+        self.inh_canvas_positions = self._controller_to_canvas(self.system.I.positions)
+        self.all_canvas_positions = np.concatenate(
+            [self.exc_canvas_positions, self.inh_canvas_positions], axis=0
+        )
+
+        for idx, label in enumerate(self.system.observation_labels):
+            self.ax_net.text(
+                0.015,
+                self.input_node_positions[idx, 1],
+                label,
+                ha="left",
+                va="center",
+                color="#c4d3e3",
+                fontsize=6.8,
+            )
+        for idx, label in enumerate(self.system.action_labels):
+            self.ax_net.text(
+                0.985,
+                self.output_node_positions[idx, 1],
+                label,
+                ha="right",
+                va="center",
+                color="#c4d3e3",
+                fontsize=8.0,
+            )
+
+        self.rec_lines = LineCollection([], zorder=1, capstyle="round", joinstyle="round")
+        self.input_lines = LineCollection([], zorder=2, capstyle="round")
+        self.output_lines = LineCollection([], zorder=2, capstyle="round")
+        self.ax_net.add_collection(self.rec_lines)
+        self.ax_net.add_collection(self.input_lines)
+        self.ax_net.add_collection(self.output_lines)
+
+        self.input_nodes = self.ax_net.scatter(
+            self.input_node_positions[:, 0],
+            self.input_node_positions[:, 1],
+            s=np.full((self.system.obs_size,), 55.0),
+            c=np.zeros((self.system.obs_size,), dtype=float),
+            cmap="coolwarm",
+            vmin=-2.0,
+            vmax=2.0,
+            edgecolors="#dbe7f3",
+            linewidths=0.9,
+            zorder=4,
+        )
+        self.output_nodes = self.ax_net.scatter(
+            self.output_node_positions[:, 0],
+            self.output_node_positions[:, 1],
+            s=np.full((self.system.action_size,), 90.0),
+            c=np.zeros((self.system.action_size,), dtype=float),
+            cmap="coolwarm",
+            vmin=-1.0,
+            vmax=1.0,
+            edgecolors="#f2f5f8",
+            linewidths=1.1,
+            zorder=4,
+        )
+
+        exc_edge = np.tile(np.asarray([[0.98, 0.72, 0.28, 0.95]]), (self.system.n_exc, 1))
+        inh_edge = np.tile(np.asarray([[0.36, 0.84, 1.0, 0.98]]), (self.system.n_inh, 1))
+        self.exc_nodes = self.ax_net.scatter(
+            self.exc_canvas_positions[:, 0],
+            self.exc_canvas_positions[:, 1],
+            s=np.full((self.system.n_exc,), 18.0),
+            c=np.zeros((self.system.n_exc,), dtype=float),
             cmap="viridis",
             vmin=0.0,
             vmax=max(1.0, self.cfg.v_th),
+            edgecolors=exc_edge,
+            linewidths=np.full((self.system.n_exc,), 0.55),
+            zorder=5,
         )
-        self.filtered_im = self.ax_filtered.imshow(
-            zero_grid.T,
-            origin="lower",
-            extent=[0.0, self.cfg.controller_dx_mm, 0.0, self.cfg.controller_dx_mm],
-            interpolation="nearest",
-            aspect="equal",
-            cmap="magma",
+        self.inh_nodes = self.ax_net.scatter(
+            self.inh_canvas_positions[:, 0],
+            self.inh_canvas_positions[:, 1],
+            s=np.full((self.system.n_inh,), 26.0),
+            marker="s",
+            c=np.zeros((self.system.n_inh,), dtype=float),
+            cmap="viridis",
             vmin=0.0,
-            vmax=1.0,
+            vmax=max(1.0, self.cfg.v_th),
+            edgecolors=inh_edge,
+            linewidths=np.full((self.system.n_inh,), 0.70),
+            zorder=5,
         )
-        self.adapt_im = self.ax_adapt.imshow(
-            self.histograms[0].T,
-            origin="lower",
-            extent=[0.0, self.cfg.controller_dx_mm, 0.0, self.cfg.controller_dx_mm],
-            interpolation="nearest",
-            aspect="equal",
-            cmap="cividis",
-            vmin=0.0,
-            vmax=1.0,
+        self.exc_spike_rings = self.ax_net.scatter(
+            self.exc_canvas_positions[:, 0],
+            self.exc_canvas_positions[:, 1],
+            s=np.zeros((self.system.n_exc,), dtype=float),
+            facecolors="none",
+            edgecolors="#ffffff",
+            linewidths=np.zeros((self.system.n_exc,), dtype=float),
+            zorder=6,
         )
-        for ax in (self.ax_spike, self.ax_membrane, self.ax_filtered, self.ax_adapt):
-            ax.set_aspect("equal", adjustable="box")
-            ax.set_box_aspect(1.0)
-            ax.set_xticks([])
-            ax.set_yticks([])
-        self.ax_spike.set_title("Spike Density")
-        self.ax_membrane.set_title("Membrane Potential")
-        self.ax_filtered.set_title("Filtered Activity")
-        self.ax_adapt.set_title("Adaptation")
+        self.inh_spike_rings = self.ax_net.scatter(
+            self.inh_canvas_positions[:, 0],
+            self.inh_canvas_positions[:, 1],
+            s=np.zeros((self.system.n_inh,), dtype=float),
+            marker="s",
+            facecolors="none",
+            edgecolors="#ffffff",
+            linewidths=np.zeros((self.system.n_inh,), dtype=float),
+            zorder=6,
+        )
 
-        obs_zero = np.zeros((self.system.obs_size,), dtype=float)
-        action_zero = np.zeros((self.system.action_size,), dtype=float)
-        self.obs_bar_y = np.arange(self.system.obs_size)
-        self.action_bar_y = np.arange(self.system.action_size)
-        self.obs_bars = self.ax_obs.barh(self.obs_bar_y, obs_zero, color="0.5", edgecolor="none")
-        self.action_bars = self.ax_action.barh(
-            self.action_bar_y, action_zero, color="0.5", edgecolor="none"
+        self.net_summary_text = self.ax_net.text(
+            0.26,
+            0.95,
+            "",
+            ha="left",
+            va="top",
+            color="#f4f7fb",
+            family="monospace",
+            fontsize=9,
+            zorder=7,
         )
-        self.ax_obs.axvline(0.0, color="0.5", lw=1.0)
-        self.ax_action.axvline(0.0, color="0.5", lw=1.0)
-        self.ax_obs.set_title("Current Input Channels")
-        self.ax_action.set_title("Current Motor Commands")
-        self.ax_obs.set_yticks(self.obs_bar_y, labels=self.system.observation_labels, fontsize=7)
-        self.ax_action.set_yticks(self.action_bar_y, labels=self.system.action_labels, fontsize=8)
-        self.ax_obs.invert_yaxis()
-        self.ax_action.invert_yaxis()
-        self.ax_obs.set_xlim(-2.2, 2.2)
-        self.ax_action.set_xlim(-1.05, 1.05)
-        self.ax_obs.grid(alpha=0.20, axis="x")
-        self.ax_action.grid(alpha=0.20, axis="x")
-
-    def _init_weight_panel(self):
-        self.w_in_im = self.ax_w_in.imshow(
-            np.zeros((self.system.obs_size, self.system.n_total), dtype=float),
-            origin="lower",
-            interpolation="nearest",
-            aspect="auto",
-            cmap="coolwarm",
-            vmin=-1.0,
-            vmax=1.0,
+        self.net_legend_text = self.ax_net.text(
+            0.26,
+            0.03,
+            (
+                "fill = membrane potential   size = filtered activity\n"
+                "white ring = spike   node outline = adaptation\n"
+                "left/right fibers = strongest input/output weights   center fibers = strongest recurrent weights"
+            ),
+            ha="left",
+            va="bottom",
+            color="#9eb2c9",
+            fontsize=8,
+            zorder=7,
         )
-        self.ax_w_in.set_title("Input Weights Into SNN")
-        self.ax_w_in.set_ylabel("input channel")
-        self.ax_w_in.set_xticks([])
-        self.ax_w_in.set_yticks(np.arange(self.system.obs_size), labels=self.system.observation_labels, fontsize=7)
-
-        self.w_rec_im = self.ax_w_rec.imshow(
-            np.zeros((self.system.n_total, self.system.n_total), dtype=float),
-            origin="lower",
-            interpolation="nearest",
-            aspect="auto",
-            cmap="coolwarm",
-            vmin=-1.0,
-            vmax=1.0,
-        )
-        self.ax_w_rec.set_title("Recurrent Weights Within SNN")
-        self.ax_w_rec.set_xlabel("post neuron")
-        self.ax_w_rec.set_ylabel("pre neuron")
-        self.ax_w_rec.set_xticks([])
-        self.ax_w_rec.set_yticks([])
-
-        self.w_out_im = self.ax_w_out.imshow(
-            np.zeros((self.system.action_size, self.system.n_total), dtype=float),
-            origin="lower",
-            interpolation="nearest",
-            aspect="auto",
-            cmap="coolwarm",
-            vmin=-1.0,
-            vmax=1.0,
-        )
-        self.ax_w_out.set_title("Output Readout Weights")
-        self.ax_w_out.set_xlabel("neuron")
-        self.ax_w_out.set_yticks(np.arange(self.system.action_size), labels=self.system.action_labels, fontsize=8)
-        self.ax_w_out.set_xticks([])
-
-        self.rec_summary_im = self.ax_rec_summary.imshow(
-            np.zeros((self.system.exc_side, self.system.exc_side), dtype=float),
-            origin="lower",
-            interpolation="nearest",
-            aspect="equal",
-            cmap="magma",
-            vmin=0.0,
-            vmax=1.0,
-        )
-        self.ax_rec_summary.set_aspect("equal", adjustable="box")
-        self.ax_rec_summary.set_box_aspect(1.0)
-        self.ax_rec_summary.set_title("Incoming |W_rec| to E")
-        self.ax_rec_summary.set_xticks([])
-        self.ax_rec_summary.set_yticks([])
-        self._update_weight_views()
+        self._update_network_weight_artists()
 
     def _init_robot_panel(self):
         self.ax_robot.set_aspect("equal", adjustable="box")
@@ -1246,43 +1271,242 @@ class TrainingViewer:
             0.0, 0.88, "", va="top", ha="left", family="monospace", fontsize=9
         )
 
-    def _exc_grid(self, values: np.ndarray) -> np.ndarray:
-        exc = np.asarray(values[: self.system.n_exc], dtype=float)
-        return exc.reshape(self.system.exc_side, self.system.exc_side)
+    def _controller_to_canvas(self, positions: np.ndarray) -> np.ndarray:
+        positions = np.asarray(positions, dtype=float)
+        x = 0.26 + 0.48 * (positions[:, 0] / self.cfg.controller_dx_mm)
+        y = 0.10 + 0.80 * (positions[:, 1] / self.cfg.controller_dx_mm)
+        return np.column_stack([x, y])
 
-    def _bar_colors(self, values: np.ndarray, limit: float):
-        cmap = plt.get_cmap("coolwarm")
-        scale = max(1e-6, float(limit))
-        normalized = np.clip(0.5 + 0.5 * (values / scale), 0.0, 1.0)
-        return cmap(normalized)
+    def _select_top_recurrent_edges(self, weights: np.ndarray):
+        pre_idx, post_idx = np.nonzero(np.abs(weights) > 0.0)
+        if len(pre_idx) == 0:
+            return (
+                np.zeros((0,), dtype=int),
+                np.zeros((0,), dtype=int),
+                np.zeros((0,), dtype=float),
+            )
+        values = weights[pre_idx, post_idx]
+        keep = min(self.max_recurrent_edges, len(values))
+        order = np.argsort(np.abs(values))[-keep:]
+        return pre_idx[order], post_idx[order], values[order]
 
-    def _update_bar_plot(self, bars, values: np.ndarray, limit: float):
+    def _select_input_edges(self, weights: np.ndarray):
+        src_idx = []
+        dst_idx = []
+        values = []
+        for src in range(weights.shape[0]):
+            row = weights[src]
+            keep = min(self.max_input_edges_per_channel, row.shape[0])
+            if keep <= 0:
+                continue
+            order = np.argsort(np.abs(row))[-keep:]
+            src_idx.extend([src] * keep)
+            dst_idx.extend(order.tolist())
+            values.extend(row[order].tolist())
+        return np.asarray(src_idx, dtype=int), np.asarray(dst_idx, dtype=int), np.asarray(values, dtype=float)
+
+    def _select_output_edges(self, weights: np.ndarray):
+        src_idx = []
+        dst_idx = []
+        values = []
+        for dst in range(weights.shape[1]):
+            col = weights[:, dst]
+            keep = min(self.max_output_edges_per_command, col.shape[0])
+            if keep <= 0:
+                continue
+            order = np.argsort(np.abs(col))[-keep:]
+            src_idx.extend(order.tolist())
+            dst_idx.extend([dst] * keep)
+            values.extend(col[order].tolist())
+        return np.asarray(src_idx, dtype=int), np.asarray(dst_idx, dtype=int), np.asarray(values, dtype=float)
+
+    def _line_style(
+        self,
+        values: np.ndarray,
+        activity: Optional[np.ndarray] = None,
+        positive_rgb=(1.00, 0.58, 0.22),
+        negative_rgb=(0.22, 0.78, 1.00),
+        alpha_floor: float = 0.04,
+        width_floor: float = 0.25,
+    ):
         values = np.asarray(values, dtype=float)
-        colors = self._bar_colors(values, limit)
-        for idx, bar in enumerate(bars):
-            bar.set_width(float(values[idx]))
-            bar.set_facecolor(colors[idx])
+        if values.size == 0:
+            return np.zeros((0, 4), dtype=float), np.zeros((0,), dtype=float)
+        scale = max(1e-6, float(np.percentile(np.abs(values), 95.0)))
+        strength = np.clip(np.abs(values) / scale, 0.0, 1.0)
+        if activity is None:
+            activity = np.ones_like(strength)
+        else:
+            activity = np.clip(np.asarray(activity, dtype=float), 0.0, 1.0)
+        colors = np.zeros((values.size, 4), dtype=float)
+        pos_mask = values >= 0.0
+        colors[pos_mask, :3] = positive_rgb
+        colors[~pos_mask, :3] = negative_rgb
+        colors[:, 3] = alpha_floor + 0.65 * strength * (0.30 + 0.70 * activity)
+        widths = width_floor + 2.2 * strength * (0.35 + 0.65 * activity)
+        return colors, widths
 
-    def _update_weight_views(self):
+    def _update_network_weight_artists(self):
         params = _tree_to_numpy(self.latest_params)
-        w_in = np.asarray(params["w_in"], dtype=float)
-        w_out = np.asarray(params["w_out"], dtype=float).T
-        w_rec = np.asarray(self.system._effective_recurrent_weights(params), dtype=float)
-        incoming_exc = np.sum(np.abs(w_rec[:, : self.system.n_exc]), axis=0)
-        incoming_exc = incoming_exc.reshape(self.system.exc_side, self.system.exc_side)
+        self.current_w_in = np.asarray(params["w_in"], dtype=float)
+        self.current_w_out = np.asarray(params["w_out"], dtype=float)
+        self.current_w_rec = np.asarray(self.system._effective_recurrent_weights(params), dtype=float)
 
-        def _set_signed_image(image, values):
-            vmax = max(1e-6, float(np.percentile(np.abs(values), 99.0)))
-            image.set_data(values)
-            image.set_clim(-vmax, vmax)
+        self.rec_edge_pre, self.rec_edge_post, self.rec_edge_values = self._select_top_recurrent_edges(
+            self.current_w_rec
+        )
+        if self.rec_edge_values.size:
+            rec_segments = np.stack(
+                [
+                    self.all_canvas_positions[self.rec_edge_pre],
+                    self.all_canvas_positions[self.rec_edge_post],
+                ],
+                axis=1,
+            )
+            self.rec_lines.set_segments(rec_segments)
+        else:
+            self.rec_lines.set_segments([])
 
-        _set_signed_image(self.w_in_im, w_in)
-        _set_signed_image(self.w_rec_im, w_rec)
-        _set_signed_image(self.w_out_im, w_out)
+        self.in_edge_src, self.in_edge_dst, self.in_edge_values = self._select_input_edges(self.current_w_in)
+        if self.in_edge_values.size:
+            in_segments = np.stack(
+                [
+                    self.input_node_positions[self.in_edge_src],
+                    self.all_canvas_positions[self.in_edge_dst],
+                ],
+                axis=1,
+            )
+            self.input_lines.set_segments(in_segments)
+        else:
+            self.input_lines.set_segments([])
 
-        rec_vmax = max(1e-6, float(np.percentile(incoming_exc, 99.0)))
-        self.rec_summary_im.set_data(incoming_exc.T)
-        self.rec_summary_im.set_clim(0.0, rec_vmax)
+        self.out_edge_src, self.out_edge_dst, self.out_edge_values = self._select_output_edges(self.current_w_out)
+        if self.out_edge_values.size:
+            out_segments = np.stack(
+                [
+                    self.all_canvas_positions[self.out_edge_src],
+                    self.output_node_positions[self.out_edge_dst],
+                ],
+                axis=1,
+            )
+            self.output_lines.set_segments(out_segments)
+        else:
+            self.output_lines.set_segments([])
+
+        self._refresh_network_edge_styles(
+            np.zeros((self.system.obs_size,), dtype=float),
+            np.zeros((self.system.action_size,), dtype=float),
+            np.zeros((self.system.n_total,), dtype=float),
+        )
+
+    def _refresh_network_edge_styles(self, obs: np.ndarray, action: np.ndarray, filtered: np.ndarray):
+        obs = np.asarray(obs, dtype=float)
+        action = np.asarray(action, dtype=float)
+        filtered = np.asarray(filtered, dtype=float)
+        filt_scale = max(1e-6, self.filtered_node_scale)
+
+        if self.rec_edge_values.size:
+            rec_activity = 0.5 * (
+                filtered[self.rec_edge_pre] / filt_scale + filtered[self.rec_edge_post] / filt_scale
+            )
+            colors, widths = self._line_style(
+                self.rec_edge_values,
+                activity=rec_activity,
+                positive_rgb=(0.98, 0.60, 0.20),
+                negative_rgb=(0.24, 0.78, 0.98),
+                alpha_floor=0.03,
+                width_floor=0.18,
+            )
+            self.rec_lines.set_colors(colors)
+            self.rec_lines.set_linewidths(widths)
+
+        if self.in_edge_values.size:
+            input_activity = np.abs(obs[self.in_edge_src]) / 2.0
+            colors, widths = self._line_style(
+                self.in_edge_values,
+                activity=input_activity,
+                positive_rgb=(0.95, 0.72, 0.28),
+                negative_rgb=(0.44, 0.85, 1.00),
+                alpha_floor=0.06,
+                width_floor=0.35,
+            )
+            self.input_lines.set_colors(colors)
+            self.input_lines.set_linewidths(widths)
+
+        if self.out_edge_values.size:
+            output_activity = np.abs(action[self.out_edge_dst])
+            colors, widths = self._line_style(
+                self.out_edge_values,
+                activity=output_activity,
+                positive_rgb=(0.99, 0.54, 0.26),
+                negative_rgb=(0.40, 0.88, 1.00),
+                alpha_floor=0.06,
+                width_floor=0.35,
+            )
+            self.output_lines.set_colors(colors)
+            self.output_lines.set_linewidths(widths)
+
+    def _update_neural_canvas(
+        self,
+        t_ms: float,
+        obs: np.ndarray,
+        action: np.ndarray,
+        membrane: np.ndarray,
+        filtered: np.ndarray,
+        adapt: np.ndarray,
+        spike: np.ndarray,
+    ):
+        obs = np.asarray(obs, dtype=float)
+        action = np.asarray(action, dtype=float)
+        membrane = np.asarray(membrane, dtype=float)
+        filtered = np.asarray(filtered, dtype=float)
+        adapt = np.asarray(adapt, dtype=float)
+        spike = np.asarray(spike, dtype=float)
+
+        exc_mem = membrane[: self.system.n_exc]
+        inh_mem = membrane[self.system.n_exc :]
+        exc_filt = filtered[: self.system.n_exc]
+        inh_filt = filtered[self.system.n_exc :]
+        exc_adapt = adapt[: self.system.n_exc]
+        inh_adapt = adapt[self.system.n_exc :]
+        exc_spike = spike[: self.system.n_exc]
+        inh_spike = spike[self.system.n_exc :]
+
+        exc_sizes = 14.0 + 140.0 * np.clip(exc_filt / max(1e-6, self.filtered_node_scale), 0.0, 1.0)
+        inh_sizes = 18.0 + 150.0 * np.clip(inh_filt / max(1e-6, self.filtered_node_scale), 0.0, 1.0)
+        exc_lw = 0.55 + 2.5 * np.clip(exc_adapt / max(1e-6, self.adapt_node_scale), 0.0, 1.0)
+        inh_lw = 0.70 + 2.3 * np.clip(inh_adapt / max(1e-6, self.adapt_node_scale), 0.0, 1.0)
+
+        self.exc_nodes.set_array(exc_mem)
+        self.inh_nodes.set_array(inh_mem)
+        self.exc_nodes.set_sizes(exc_sizes)
+        self.inh_nodes.set_sizes(inh_sizes)
+        self.exc_nodes.set_linewidths(exc_lw)
+        self.inh_nodes.set_linewidths(inh_lw)
+
+        self.exc_spike_rings.set_sizes(np.where(exc_spike > 0.0, exc_sizes + 52.0, 0.0))
+        self.inh_spike_rings.set_sizes(np.where(inh_spike > 0.0, inh_sizes + 58.0, 0.0))
+        self.exc_spike_rings.set_linewidths(np.where(exc_spike > 0.0, 1.6, 0.0))
+        self.inh_spike_rings.set_linewidths(np.where(inh_spike > 0.0, 1.7, 0.0))
+
+        self.input_nodes.set_array(obs)
+        self.output_nodes.set_array(action)
+        self.input_nodes.set_sizes(42.0 + 150.0 * np.clip(np.abs(obs) / 2.0, 0.0, 1.0))
+        self.output_nodes.set_sizes(78.0 + 220.0 * np.clip(np.abs(action), 0.0, 1.0))
+
+        self._refresh_network_edge_styles(obs, action, filtered)
+        self.net_summary_text.set_text(
+            "\n".join(
+                [
+                    f"t={t_ms:6.0f} ms",
+                    f"mean membrane : {np.mean(membrane): .3f}",
+                    f"mean filtered : {np.mean(filtered): .3f}",
+                    f"spike rate    : {np.mean(spike): .3f}",
+                    f"input |obs|   : {np.mean(np.abs(obs)): .3f}",
+                    f"output |act|  : {np.mean(np.abs(action)): .3f}",
+                ]
+            )
+        )
 
     def _set_phase(self, phase: str, detail: str):
         self.current_phase = phase
@@ -1332,7 +1556,7 @@ class TrainingViewer:
                 if "params" in message and message["params"] is not None:
                     self.latest_params = _tree_to_numpy(message["params"])
                     self.system.params = self.latest_params
-                    self._update_weight_views()
+                    self._update_network_weight_artists()
                 self._set_rollout(message["rollout"], message["metrics"])
                 continue
 
@@ -1376,29 +1600,15 @@ class TrainingViewer:
         self.frame_times = ts_ms[frame_indices]
         self.frame_ptr = 0
 
-        runner = RolloutRunner(mon=rollout)
-        _log(f"viewer: preparing spike maps for {len(self.frame_times)} frames")
-        self.histograms, _ = prepare_spike_histograms_for_times(
-            self.system,
-            runner,
-            self.frame_times,
-            self.cfg.window_size_ms,
-            progress_label="preparing spike maps",
-        )
-        _log("viewer: spike maps ready")
-        spike_vmax = max(1.0, float(np.max(self.histograms)))
-        self.spike_im.set_clim(0.0, spike_vmax)
-
-        exc_v = np.asarray(rollout["v"][:, : self.system.n_exc], dtype=float)
-        exc_filt = np.asarray(rollout["filtered_spike"][:, : self.system.n_exc], dtype=float)
-        exc_adapt = np.asarray(rollout["adapt"][:, : self.system.n_exc], dtype=float)
-        v_lo = float(min(0.0, np.percentile(exc_v, 1.0)))
-        v_hi = float(max(self.cfg.v_th, np.percentile(exc_v, 99.0)))
-        filt_hi = float(max(1.0, np.percentile(exc_filt, 99.0)))
-        adapt_hi = float(max(1.0, np.percentile(exc_adapt, 99.0)))
-        self.membrane_im.set_clim(v_lo, v_hi)
-        self.filtered_im.set_clim(0.0, filt_hi)
-        self.adapt_im.set_clim(0.0, adapt_hi)
+        membrane = np.asarray(rollout["v"], dtype=float)
+        filtered = np.asarray(rollout["filtered_spike"], dtype=float)
+        adapt = np.asarray(rollout["adapt"], dtype=float)
+        v_lo = float(min(0.0, np.percentile(membrane, 1.0)))
+        v_hi = float(max(self.cfg.v_th, np.percentile(membrane, 99.0)))
+        self.exc_nodes.set_clim(v_lo, v_hi)
+        self.inh_nodes.set_clim(v_lo, v_hi)
+        self.filtered_node_scale = float(max(1.0, np.percentile(filtered, 99.0)))
+        self.adapt_node_scale = float(max(1.0, np.percentile(adapt, 99.0)))
 
         pos = np.asarray(rollout["pos"], dtype=float)
         foot_pos = np.asarray(rollout["foot_pos"], dtype=float)
@@ -1446,23 +1656,16 @@ class TrainingViewer:
         membrane = np.asarray(rollout["v"], dtype=float)
         filtered = np.asarray(rollout["filtered_spike"], dtype=float)
         adapt = np.asarray(rollout["adapt"], dtype=float)
-
-        self.spike_im.set_data(self.histograms[frame_ptr].T)
-        self.membrane_im.set_data(self._exc_grid(membrane[i]).T)
-        self.filtered_im.set_data(self._exc_grid(filtered[i]).T)
-        self.adapt_im.set_data(self._exc_grid(adapt[i]).T)
-        self.ax_spike.set_title(f"Spike Density | t={self.frame_times[frame_ptr]:.0f} ms")
-        self.ax_membrane.set_title(
-            f"Membrane Potential | mean={np.mean(membrane[i, : self.system.n_exc]):.3f}"
+        spike = np.asarray(rollout["spike"], dtype=float)
+        self._update_neural_canvas(
+            self.frame_times[frame_ptr],
+            obs[i],
+            action[i],
+            membrane[i],
+            filtered[i],
+            adapt[i],
+            spike[i],
         )
-        self.ax_filtered.set_title(
-            f"Filtered Activity | mean={np.mean(filtered[i, : self.system.n_exc]):.3f}"
-        )
-        self.ax_adapt.set_title(
-            f"Adaptation | mean={np.mean(adapt[i, : self.system.n_exc]):.3f}"
-        )
-        self._update_bar_plot(self.obs_bars, obs[i], limit=2.0)
-        self._update_bar_plot(self.action_bars, action[i], limit=1.0)
 
         p = pos[i]
         theta = float(angle[i])
