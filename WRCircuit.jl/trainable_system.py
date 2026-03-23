@@ -115,7 +115,6 @@ class Config:
     knee_action_scale: float = 0.55
 
     # Task / training.
-    base_freq_hz: float = 1.8
     target_vx: float = 0.40
     target_vy: float = 0.0
     episode_ms: float = 1500.0
@@ -133,9 +132,6 @@ class Config:
     optim_steps_per_tick: int = 1
     animation_fps: float = 30.0
     window_size_ms: float = 40.0
-    hip_phase_scale: float = 0.55
-    knee_phase_scale: float = 0.45
-    gait_prior_weight: float = 0.05
     es_population: int = 4
     es_noise_std: float = 0.03
     es_reward_scale: float = 1.0
@@ -214,16 +210,11 @@ def build_feature_sequence(
     dt_ms: float,
     target_vx: float,
     target_vy: float,
-    base_freq_hz: float,
 ) -> np.ndarray:
-    ts_s = np.arange(num_steps, dtype=float) * (dt_ms / 1000.0)
-    phase = 2.0 * np.pi * base_freq_hz * ts_s
     return np.stack(
         [
             np.full((num_steps,), target_vx, dtype=np.float32),
             np.full((num_steps,), target_vy, dtype=np.float32),
-            np.sin(phase).astype(np.float32),
-            np.cos(phase).astype(np.float32),
         ],
         axis=1,
     ).astype(np.float32)
@@ -329,7 +320,7 @@ class TrainableWalkingSystem:
         self.n_exc = self.exc_side * self.exc_side
         self.n_inh = max(1, int(round(self.n_exc / cfg.gamma)))
         self.n_total = self.n_exc + self.n_inh
-        self.obs_size = 23
+        self.obs_size = 21
         self.action_size = 2 * cfg.n_legs
 
         self.exc_positions = _grid_positions(self.exc_side, cfg.controller_dx_mm)
@@ -403,8 +394,6 @@ class TrainableWalkingSystem:
             [
                 max(1.0, abs(cfg.target_vx)),
                 max(1.0, abs(cfg.target_vy)),
-                1.0,
-                1.0,
                 cfg.height_target,
                 1.0,
                 1.0,
@@ -565,12 +554,11 @@ class TrainableWalkingSystem:
                 self.cfg.dt_ms,
                 self.cfg.target_vx,
                 self.cfg.target_vy,
-                self.cfg.base_freq_hz,
             )
         features = np.asarray(features, dtype=np.float32)
-        if features.shape != (self.num_steps, 4):
+        if features.shape != (self.num_steps, 2):
             raise ValueError(
-                f"Expected features with shape {(self.num_steps, 4)}, got {features.shape}."
+                f"Expected features with shape {(self.num_steps, 2)}, got {features.shape}."
             )
         return features
 
@@ -680,14 +668,6 @@ class TrainableWalkingSystem:
         ))
         joint_limit_penalty = hip_limit_penalty + knee_limit_penalty
 
-        phase = features[:, 2:3]
-        desired_hip = cfg.hip_phase_scale * phase * np.asarray([[1.0, -1.0]], dtype=np.float32)
-        desired_knee = cfg.knee_phase_scale * np.maximum(
-            -phase * np.asarray([[1.0, -1.0]], dtype=np.float32), 0.0
-        )
-        desired_action = np.concatenate([desired_hip, desired_knee], axis=1)
-        gait_prior = float(np.mean(np.square(action - desired_action)))
-
         reward = cfg.reward_distance * distance + cfg.reward_speed * mean_vx
         reward = reward - cfg.penalty_speed_tracking * speed_tracking
         reward = reward - cfg.penalty_height * height_error
@@ -697,7 +677,6 @@ class TrainableWalkingSystem:
         reward = reward - cfg.penalty_slip * slip
         reward = reward - cfg.penalty_collapse * collapse
         reward = reward - cfg.penalty_joint_limit * joint_limit_penalty
-        reward = reward - cfg.gait_prior_weight * gait_prior
 
         loss = -reward
         metrics = {
@@ -1363,7 +1342,6 @@ def main():
         cfg.dt_ms,
         cfg.target_vx,
         cfg.target_vy,
-        cfg.base_freq_hz,
     )
     ctx = mp.get_context("spawn")
     message_queue = ctx.Queue(maxsize=4)
