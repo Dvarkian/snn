@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import multiprocessing as mp
+import queue
 import time
 import os
 from types import SimpleNamespace
@@ -248,6 +250,25 @@ def _tree_to_numpy(tree):
 
 def _python_metrics(metrics: Dict[str, Any]) -> Dict[str, float]:
     return {key: float(np.asarray(value)) for key, value in metrics.items()}
+
+
+def _queue_put_latest(message_queue, message):
+    try:
+        message_queue.put_nowait(message)
+        return
+    except queue.Full:
+        pass
+
+    try:
+        while True:
+            message_queue.get_nowait()
+    except queue.Empty:
+        pass
+
+    try:
+        message_queue.put_nowait(message)
+    except queue.Full:
+        pass
 
 
 class TerminalProgressBar:
@@ -788,13 +809,123 @@ def prepare_spike_histograms_for_times(
     return histograms, domain
 
 
+def _training_worker(cfg: Config, features: np.ndarray, message_queue, stop_event):
+    try:
+        system = TrainableWalkingSystem(cfg)
+        refresh_every = cfg.vis_every if cfg.vis_every > 0 else cfg.eval_every
+
+        _queue_put_latest(
+            message_queue,
+            {
+                "type": "status",
+                "phase": "evaluating",
+                "detail": "running initial rollout",
+            },
+        )
+        rollout, metrics = system.evaluate_with_progress(
+            features,
+            progress_label="initial rollout",
+        )
+        _queue_put_latest(
+            message_queue,
+            {
+                "type": "snapshot",
+                "epoch": 0,
+                "rollout": rollout,
+                "metrics": metrics,
+                "phase": "idle",
+                "detail": "ready to train",
+            },
+        )
+
+        epoch = 0
+        while epoch < cfg.train_epochs and not stop_event.is_set():
+            _queue_put_latest(
+                message_queue,
+                {
+                    "type": "status",
+                    "phase": "training",
+                    "detail": "running optimizer step",
+                },
+            )
+            latest_metrics = system.train_step(features)
+            epoch += 1
+
+            _queue_put_latest(
+                message_queue,
+                {
+                    "type": "metrics",
+                    "epoch": epoch,
+                    "metrics": latest_metrics,
+                    "phase": "training",
+                    "detail": "optimizer step complete",
+                },
+            )
+
+            should_refresh = epoch == 1 or epoch % max(1, refresh_every) == 0 or epoch >= cfg.train_epochs
+            if should_refresh and not stop_event.is_set():
+                _queue_put_latest(
+                    message_queue,
+                    {
+                        "type": "status",
+                        "phase": "evaluating",
+                        "detail": "refreshing rollout for UI",
+                    },
+                )
+                rollout, eval_metrics = system.evaluate_with_progress(
+                    features,
+                    progress_label="refresh rollout",
+                )
+                _queue_put_latest(
+                    message_queue,
+                    {
+                        "type": "snapshot",
+                        "epoch": epoch,
+                        "rollout": rollout,
+                        "metrics": eval_metrics,
+                        "phase": "idle" if epoch < cfg.train_epochs else "done",
+                        "detail": "snapshot ready",
+                    },
+                )
+
+        _queue_put_latest(
+            message_queue,
+            {
+                "type": "done",
+                "epoch": epoch,
+                "phase": "done",
+                "detail": "training complete",
+            },
+        )
+    except Exception as exc:  # pragma: no cover - worker-side runtime path.
+        _queue_put_latest(
+            message_queue,
+            {
+                "type": "error",
+                "phase": "error",
+                "detail": str(exc),
+            },
+        )
+
+
 class TrainingViewer:
-    def __init__(self, system: TrainableWalkingSystem, features: np.ndarray):
+    def __init__(
+        self,
+        system: TrainableWalkingSystem,
+        features: np.ndarray,
+        message_queue,
+        stop_event,
+        worker_process,
+    ):
         self.system = system
         self.cfg = system.cfg
         self.features = features
+        self.message_queue = message_queue
+        self.stop_event = stop_event
+        self.worker_process = worker_process
         self.closed = False
         self.epoch = 0
+        self.last_epoch_seen = -1
 
         self.history_steps = []
         self.history_distance = []
@@ -813,8 +944,7 @@ class TrainingViewer:
         self.train_tick_count = 0
         self.start_time = time.perf_counter()
         self.last_log_time = self.start_time
-        self.bootstrap_pending = True
-        self._bootstrap_started = False
+        self.worker_done = False
 
         self.fig = plt.figure(figsize=(14, 8))
         gs = self.fig.add_gridspec(2, 2, width_ratios=[1.15, 1.0], hspace=0.30, wspace=0.28)
@@ -841,7 +971,7 @@ class TrainingViewer:
 
         self.fig.canvas.mpl_connect("close_event", self._on_close)
 
-        self._set_phase("starting", "viewer ready, waiting for first rollout")
+        self._set_phase("starting", "viewer ready, waiting for backend")
         self._refresh_status()
 
         self.anim_timer = self.fig.canvas.new_timer(
@@ -924,8 +1054,63 @@ class TrainingViewer:
 
     def _on_close(self, _event):
         self.closed = True
+        self.stop_event.set()
         self.anim_timer.stop()
         self.train_timer.stop()
+
+    def _record_metrics(self, epoch: int, metrics: Dict[str, float]):
+        if epoch <= self.last_epoch_seen:
+            return
+        self.last_epoch_seen = epoch
+        self.epoch = epoch
+        self.latest_metrics = metrics
+        self.history_steps.append(epoch)
+        self.history_distance.append(metrics["distance"])
+        self.history_speed.append(metrics["mean_vx"])
+        self.history_loss.append(metrics["loss"])
+
+    def _drain_backend_messages(self):
+        received = False
+        while True:
+            try:
+                message = self.message_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            received = True
+            msg_type = message.get("type")
+            phase = message.get("phase")
+            detail = message.get("detail")
+            if phase is not None and detail is not None:
+                self._set_phase(phase, detail)
+
+            if msg_type == "status":
+                continue
+
+            if msg_type == "metrics":
+                self._record_metrics(int(message["epoch"]), message["metrics"])
+                continue
+
+            if msg_type == "snapshot":
+                self._record_metrics(int(message["epoch"]), message["metrics"])
+                self._set_rollout(message["rollout"], message["metrics"])
+                continue
+
+            if msg_type == "done":
+                self.worker_done = True
+                self.epoch = max(self.epoch, int(message.get("epoch", self.epoch)))
+                self._set_phase("done", message.get("detail", "training complete"))
+                continue
+
+            if msg_type == "error":
+                self.worker_done = True
+                self._set_phase("error", message.get("detail", "backend failed"))
+                print(
+                    "[trainable_system] backend error: "
+                    f"{message.get('detail', 'unknown error')}",
+                    flush=True,
+                )
+        return received
 
     def _rotation_matrix(self, theta: float) -> np.ndarray:
         c = np.cos(theta)
@@ -1130,92 +1315,31 @@ class TrainingViewer:
     def _on_train_tick(self):
         if self.closed:
             return
-        if self.bootstrap_pending:
-            self.train_tick_count += 1
-            self._set_phase("evaluating", "running initial rollout / JAX compile")
-            self._refresh_status()
-            self.fig.canvas.draw_idle()
-            if not self._bootstrap_started:
-                print(
-                    "[trainable_system] starting initial rollout and JAX compile...",
-                    flush=True,
-                )
-                self._bootstrap_started = True
-            bootstrap_start = time.perf_counter()
-            rollout, metrics = self.system.evaluate_with_progress(
-                self.features,
-                progress_label="initial rollout",
-            )
-            self.last_phase_seconds = time.perf_counter() - bootstrap_start
-            self._set_rollout(rollout, metrics)
-            self.bootstrap_pending = False
-            self._set_phase("idle", "ready to train")
-            print(
-                "[trainable_system] initial rollout ready "
-                f"(compile_s={self.last_phase_seconds:.2f})",
-                flush=True,
-            )
-            self._refresh_metric_plot()
-            self._refresh_status()
-            self.fig.canvas.draw_idle()
-            return
-        if self.epoch >= self.cfg.train_epochs:
-            self.train_timer.stop()
-            return
-
         self.train_tick_count += 1
-        latest_metrics = None
-        tick_start = time.perf_counter()
-        self._set_phase("training", "running optimizer step")
-        for _ in range(max(1, self.cfg.optim_steps_per_tick)):
-            latest_metrics = self.system.train_step(self.features)
-            self.epoch += 1
-            self.history_steps.append(self.epoch)
-            self.history_distance.append(latest_metrics["distance"])
-            self.history_speed.append(latest_metrics["mean_vx"])
-            self.history_loss.append(latest_metrics["loss"])
-            if self.epoch >= self.cfg.train_epochs:
-                break
+        changed = self._drain_backend_messages()
+        if not self.worker_process.is_alive() and not self.worker_done:
+            self.worker_done = True
+            if self.current_phase not in {"done", "error"}:
+                self._set_phase("done", "backend exited")
 
-        refresh_every = self.cfg.vis_every if self.cfg.vis_every > 0 else self.cfg.eval_every
-        should_refresh = self.epoch == 1 or self.epoch % max(1, refresh_every) == 0
-        if should_refresh:
-            self._set_phase("evaluating", "refreshing rollout for UI")
-            rollout, eval_metrics = self.system.evaluate_with_progress(
-                self.features,
-                progress_label="refresh rollout",
-            )
-            self._set_rollout(rollout, eval_metrics)
-        elif latest_metrics is not None:
-            self.latest_metrics = latest_metrics
-
-        self.last_phase_seconds = time.perf_counter() - tick_start
-        if latest_metrics is not None:
+        if self.worker_done and self.current_phase != "error":
+            self.train_timer.stop()
+        if changed:
             now = time.perf_counter()
-            if should_refresh or (now - self.last_log_time) >= 2.0:
+            if self.latest_metrics is not None and (now - self.last_log_time) >= 0.5:
                 print(
                     "[trainable_system] "
                     f"epoch={self.epoch}/{self.cfg.train_epochs} "
                     f"phase={self.current_phase} "
-                    f"loss={latest_metrics['loss']:.4f} "
-                    f"distance={latest_metrics['distance']:.4f} "
-                    f"vx={latest_metrics['mean_vx']:.4f} "
-                    f"grad={latest_metrics['grad_norm']:.4f} "
-                    f"tick_s={self.last_phase_seconds:.2f}",
+                    f"loss={self.latest_metrics['loss']:.4f} "
+                    f"distance={self.latest_metrics['distance']:.4f} "
+                    f"vx={self.latest_metrics['mean_vx']:.4f}",
                     flush=True,
                 )
                 self.last_log_time = now
-
-        if self.epoch >= self.cfg.train_epochs:
-            self._set_phase("done", "training complete")
-        else:
-            self._set_phase("idle", "waiting for next timer tick")
         self._refresh_metric_plot()
         self._refresh_status()
         self.fig.canvas.draw_idle()
-
-        if self.epoch >= self.cfg.train_epochs:
-            self.train_timer.stop()
 
     def show(self):
         self.anim_timer.start()
@@ -1241,9 +1365,26 @@ def main():
         cfg.target_vy,
         cfg.base_freq_hz,
     )
+    ctx = mp.get_context("spawn")
+    message_queue = ctx.Queue(maxsize=4)
+    stop_event = ctx.Event()
+    worker_process = ctx.Process(
+        target=_training_worker,
+        args=(cfg, features, message_queue, stop_event),
+        daemon=True,
+    )
+    print("[trainable_system] starting backend worker...", flush=True)
+    worker_process.start()
     print("[trainable_system] opening training viewer...", flush=True)
-    viewer = TrainingViewer(system, features)
-    viewer.show()
+    viewer = TrainingViewer(system, features, message_queue, stop_event, worker_process)
+    try:
+        viewer.show()
+    finally:
+        stop_event.set()
+        worker_process.join(timeout=5.0)
+        if worker_process.is_alive():
+            worker_process.terminate()
+            worker_process.join(timeout=2.0)
 
 
 __all__ = [
