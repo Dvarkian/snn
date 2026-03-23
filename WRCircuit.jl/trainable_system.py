@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
 import time
 import os
 from types import SimpleNamespace
@@ -380,6 +381,10 @@ class TrainableWalkingSystem:
 
         self.params = self._init_params(param_key)
         self.opt_state = self._adam_init(self.params)
+        self._compiled_rollout_and_metrics = jax.jit(self._rollout_and_metrics)
+        self._compiled_loss_and_grad = jax.jit(
+            jax.value_and_grad(self._loss_and_metrics, has_aux=True)
+        )
 
     def _init_params(self, key):
         k1, k2, k3 = jax.random.split(key, 3)
@@ -544,6 +549,11 @@ class TrainableWalkingSystem:
         return features
 
     def _simulate(self, params, features, progress_label: Optional[str] = None):
+        if progress_label is None:
+            return self._simulate_scan(params, features)
+        return self._simulate_python(params, features, progress_label)
+
+    def _simulate_python(self, params, features, progress_label: Optional[str] = None):
         state = self._initial_walker_state()
         ctrl_state = self._controller_initial_state()
         progress = None
@@ -615,6 +625,67 @@ class TrainableWalkingSystem:
             "I.spike": spikes[:, self.n_exc :],
         }
 
+    def _simulate_scan(self, params, features):
+        state0 = self._initial_walker_state()
+        ctrl_state0 = self._controller_initial_state()
+
+        def scan_step(carry, feature_t):
+            state, ctrl_state = carry
+            sensed = self.physics.sense(state)
+            obs = self._build_observation(state, sensed, feature_t)
+            ctrl_state, action = self._controller_step(params, ctrl_state, obs)
+            hip_target, knee_target = self._decode_targets(action)
+            step = self.physics.step(state, hip_target, knee_target)
+            next_state = step.state
+            outputs = {
+                "pos": jnp.asarray(next_state.pos, dtype=jnp.float32),
+                "vel": jnp.asarray(next_state.vel, dtype=jnp.float32),
+                "angle": jnp.asarray(next_state.angle, dtype=jnp.float32),
+                "omega": jnp.asarray(next_state.omega, dtype=jnp.float32),
+                "hip_angle": jnp.asarray(next_state.hip_angle, dtype=jnp.float32),
+                "knee_angle": jnp.asarray(next_state.knee_angle, dtype=jnp.float32),
+                "foot_pos": jnp.asarray(step.foot_pos, dtype=jnp.float32),
+                "foot_vel": jnp.asarray(step.foot_vel, dtype=jnp.float32),
+                "ground_contact": jnp.asarray(step.ground_contact, dtype=jnp.float32),
+                "force": jnp.asarray(step.total_ground_force, dtype=jnp.float32),
+                "joint_torque": jnp.asarray(step.joint_torque, dtype=jnp.float32),
+                "action": jnp.asarray(action, dtype=jnp.float32),
+                "spike": jnp.asarray(ctrl_state["spike"], dtype=jnp.float32),
+                "filtered_spike": jnp.asarray(ctrl_state["filt"], dtype=jnp.float32),
+            }
+            return (next_state, ctrl_state), outputs
+
+        (_, _), traj = jax.lax.scan(scan_step, (state0, ctrl_state0), features)
+        spikes = traj["spike"]
+        return {
+            "ts": jnp.arange(self.num_steps, dtype=jnp.float32) * self.cfg.dt_ms,
+            "pos": traj["pos"],
+            "vel": traj["vel"],
+            "angle": traj["angle"],
+            "omega": traj["omega"],
+            "hip_angle": traj["hip_angle"],
+            "knee_angle": traj["knee_angle"],
+            "foot_pos": traj["foot_pos"],
+            "foot_vel": traj["foot_vel"],
+            "ground_contact": traj["ground_contact"],
+            "force": traj["force"],
+            "joint_torque": traj["joint_torque"],
+            "action": traj["action"],
+            "spike": spikes,
+            "filtered_spike": traj["filtered_spike"],
+            "E.spike": spikes[:, : self.n_exc],
+            "I.spike": spikes[:, self.n_exc :],
+        }
+
+    def _loss_and_metrics(self, params, features):
+        rollout = self._simulate_scan(params, features)
+        return self._metrics_from_rollout(rollout, features)
+
+    def _rollout_and_metrics(self, params, features):
+        rollout = self._simulate_scan(params, features)
+        _, metrics = self._metrics_from_rollout(rollout, features)
+        return rollout, metrics
+
     def _metrics_from_rollout(self, rollout, features):
         cfg = self.cfg
         pos = rollout["pos"]
@@ -682,12 +753,8 @@ class TrainableWalkingSystem:
 
     def train_step(self, features: Optional[np.ndarray] = None) -> Dict[str, float]:
         features = self._coerce_features(features)
-
-        def loss_fn(params):
-            rollout = self._simulate(params, features)
-            return self._metrics_from_rollout(rollout, features)
-
-        (loss, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(self.params)
+        (loss, metrics), grads = self._compiled_loss_and_grad(self.params, features)
+        loss = jax.block_until_ready(loss)
         grad_norm = _tree_global_norm(grads)
         scale = jnp.minimum(1.0, self.cfg.gradient_clip / (grad_norm + 1e-8))
         grads = jax.tree_util.tree_map(lambda gg: gg * scale, grads)
@@ -700,17 +767,24 @@ class TrainableWalkingSystem:
 
     def evaluate(self, features: Optional[np.ndarray] = None):
         features = self._coerce_features(features)
-        rollout = self._simulate(self.params, features)
-        _, metrics = self._metrics_from_rollout(rollout, features)
+        rollout, metrics = self._compiled_rollout_and_metrics(self.params, features)
+        rollout["pos"].block_until_ready()
         return _tree_to_numpy(rollout), _python_metrics(metrics)
 
     def evaluate_with_progress(
         self, features: Optional[np.ndarray] = None, progress_label: str = "rollout"
     ):
         features = self._coerce_features(features)
-        rollout = self._simulate(self.params, features, progress_label=progress_label)
-        _, metrics = self._metrics_from_rollout(rollout, features)
-        return _tree_to_numpy(rollout), _python_metrics(metrics)
+        progress = TerminalProgressBar(3, progress_label)
+        progress.update(1)
+        rollout, metrics = self._compiled_rollout_and_metrics(self.params, features)
+        rollout["pos"].block_until_ready()
+        progress.update(2)
+        rollout = _tree_to_numpy(rollout)
+        metrics = _python_metrics(metrics)
+        progress.update(3)
+        progress.finish()
+        return rollout, metrics
 
 
 def collect_rollout(

@@ -17,6 +17,7 @@ import jax
 import jax.numpy as jnp
 
 
+@jax.tree_util.register_pytree_node_class
 @dataclass(frozen=True)
 class WalkerState:
     pos: Any
@@ -28,14 +29,41 @@ class WalkerState:
     hip_omega: Any
     knee_omega: Any
 
+    def tree_flatten(self):
+        children = (
+            self.pos,
+            self.vel,
+            self.angle,
+            self.omega,
+            self.hip_angle,
+            self.knee_angle,
+            self.hip_omega,
+            self.knee_omega,
+        )
+        return children, None
 
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        return cls(*children)
+
+
+@jax.tree_util.register_pytree_node_class
 @dataclass(frozen=True)
 class WalkerSensors:
     foot_pos: Any
     foot_vel: Any
     ground_contact: Any
 
+    def tree_flatten(self):
+        children = (self.foot_pos, self.foot_vel, self.ground_contact)
+        return children, None
 
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        return cls(*children)
+
+
+@jax.tree_util.register_pytree_node_class
 @dataclass(frozen=True)
 class WalkerStepResult:
     state: WalkerState
@@ -44,6 +72,21 @@ class WalkerStepResult:
     ground_contact: Any
     total_ground_force: Any
     joint_torque: Any
+
+    def tree_flatten(self):
+        children = (
+            self.state,
+            self.foot_pos,
+            self.foot_vel,
+            self.ground_contact,
+            self.total_ground_force,
+            self.joint_torque,
+        )
+        return children, None
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        return cls(*children)
 
 
 class WalkerPhysics:
