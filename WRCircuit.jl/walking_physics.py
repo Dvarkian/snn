@@ -14,8 +14,7 @@ from typing import Any
 import numpy as np
 
 import jax
-
-import brainpy.math as bm
+import jax.numpy as jnp
 
 
 @dataclass(frozen=True)
@@ -65,15 +64,16 @@ class WalkerPhysics:
         ) / 12.0
         self.thigh_inertia = cfg.thigh_mass * cfg.thigh_length**2 / 12.0
         self.shank_inertia = cfg.shank_mass * cfg.shank_length**2 / 12.0
+        self.dt = float(cfg.dt_ms) / 1000.0
 
         hip_y = -0.5 * cfg.body_height
-        self.hip_local = bm.asarray(
+        self.hip_local = jnp.asarray(
             [
                 [cfg.hip_x_offset, hip_y],
                 [-cfg.hip_x_offset, hip_y],
             ]
         )
-        self.bottom_corners_local = bm.asarray(
+        self.bottom_corners_local = jnp.asarray(
             [
                 [0.5 * cfg.body_length, -0.5 * cfg.body_height],
                 [-0.5 * cfg.body_length, -0.5 * cfg.body_height],
@@ -81,22 +81,22 @@ class WalkerPhysics:
         )
 
     def _rotation_matrix(self, theta):
-        c = bm.cos(theta)
-        s = bm.sin(theta)
-        return bm.asarray([[c, -s], [s, c]])
+        c = jnp.cos(theta)
+        s = jnp.sin(theta)
+        return jnp.asarray([[c, -s], [s, c]])
 
     def _world_points(self, local_points, pos, theta):
         rot = self._rotation_matrix(theta)
         return local_points @ rot.T + pos[None, :]
 
     def _segment_dir(self, angle):
-        return bm.stack([bm.sin(angle), -bm.cos(angle)], axis=-1)
+        return jnp.stack([jnp.sin(angle), -jnp.cos(angle)], axis=-1)
 
     def _pack_q(self, state: WalkerState):
-        return bm.concatenate(
+        return jnp.concatenate(
             [
                 state.pos,
-                bm.asarray([state.angle]),
+                jnp.asarray([state.angle]),
                 state.hip_angle,
                 state.knee_angle,
             ],
@@ -104,10 +104,10 @@ class WalkerPhysics:
         )
 
     def _pack_qd(self, state: WalkerState):
-        return bm.concatenate(
+        return jnp.concatenate(
             [
                 state.vel,
-                bm.asarray([state.omega]),
+                jnp.asarray([state.omega]),
                 state.hip_omega,
                 state.knee_omega,
             ],
@@ -171,22 +171,22 @@ class WalkerPhysics:
         return knee_pos + 0.5 * self.cfg.shank_length * shank_dir
 
     def _ground_forces(self, points, velocities):
-        penetration = bm.relu(-points[:, 1])
-        normal = self.cfg.ground_k * penetration - self.cfg.ground_c * bm.minimum(
+        penetration = jax.nn.relu(-points[:, 1])
+        normal = self.cfg.ground_k * penetration - self.cfg.ground_c * jnp.minimum(
             velocities[:, 1], 0.0
         )
-        normal = bm.maximum(normal, 0.0)
+        normal = jnp.maximum(normal, 0.0)
         max_tangent = self.cfg.friction_mu * normal
-        tangent = -bm.clip(
+        tangent = -jnp.clip(
             self.cfg.ground_tangent_damping * velocities[:, 0],
             -max_tangent,
             max_tangent,
         )
-        contact = bm.where(penetration > 1e-6, 1.0, 0.0)
-        return bm.stack([tangent, normal], axis=1), contact
+        contact = jnp.where(penetration > 1e-6, 1.0, 0.0)
+        return jnp.stack([tangent, normal], axis=1), contact
 
     def _point_velocities_from_jacobian(self, jacobian, qd):
-        return bm.einsum("aij,j->ai", jacobian, qd)
+        return jnp.einsum("aij,j->ai", jacobian, qd)
 
     def _kinetic_energy(self, q, qd):
         body_vel = qd[:2]
@@ -202,14 +202,14 @@ class WalkerPhysics:
         thigh_omega = thigh_angle_jac @ qd
         shank_omega = shank_angle_jac @ qd
 
-        body_ke = 0.5 * self.cfg.mass * bm.sum(body_vel**2)
+        body_ke = 0.5 * self.cfg.mass * jnp.sum(body_vel**2)
         body_ke += 0.5 * self.body_inertia * body_omega**2
 
-        thigh_ke = 0.5 * self.cfg.thigh_mass * bm.sum(thigh_vel**2)
-        thigh_ke += 0.5 * self.thigh_inertia * bm.sum(thigh_omega**2)
+        thigh_ke = 0.5 * self.cfg.thigh_mass * jnp.sum(thigh_vel**2)
+        thigh_ke += 0.5 * self.thigh_inertia * jnp.sum(thigh_omega**2)
 
-        shank_ke = 0.5 * self.cfg.shank_mass * bm.sum(shank_vel**2)
-        shank_ke += 0.5 * self.shank_inertia * bm.sum(shank_omega**2)
+        shank_ke = 0.5 * self.cfg.shank_mass * jnp.sum(shank_vel**2)
+        shank_ke += 0.5 * self.shank_inertia * jnp.sum(shank_omega**2)
         return body_ke + thigh_ke + shank_ke
 
     def _potential_energy(self, q):
@@ -218,8 +218,8 @@ class WalkerPhysics:
         shank_com = self._shank_com_positions(q)
 
         pe = self.cfg.mass * self.cfg.gravity * body_com[1]
-        pe += self.cfg.thigh_mass * self.cfg.gravity * bm.sum(thigh_com[:, 1])
-        pe += self.cfg.shank_mass * self.cfg.gravity * bm.sum(shank_com[:, 1])
+        pe += self.cfg.thigh_mass * self.cfg.gravity * jnp.sum(thigh_com[:, 1])
+        pe += self.cfg.shank_mass * self.cfg.gravity * jnp.sum(shank_com[:, 1])
         return pe
 
     def _mass_and_bias(self, q, qd):
@@ -246,9 +246,9 @@ class WalkerPhysics:
         corner_vel = self._point_velocities_from_jacobian(corner_jac, qd)
         corner_force, _ = self._ground_forces(corner_pos, corner_vel)
 
-        generalized = bm.einsum("aij,ai->j", foot_jac, foot_force)
-        generalized = generalized + bm.einsum("aij,ai->j", corner_jac, corner_force)
-        total_ground_force = bm.sum(foot_force, axis=0) + bm.sum(corner_force, axis=0)
+        generalized = jnp.einsum("aij,ai->j", foot_jac, foot_force)
+        generalized = generalized + jnp.einsum("aij,ai->j", corner_jac, corner_force)
+        total_ground_force = jnp.sum(foot_force, axis=0) + jnp.sum(corner_force, axis=0)
         return generalized, foot_pos, foot_vel, foot_contact, total_ground_force
 
     def initial_joint_configuration(self):
@@ -280,14 +280,14 @@ class WalkerPhysics:
     def initial_state(self) -> WalkerState:
         hip0, knee0 = self.initial_joint_configuration()
         return WalkerState(
-            pos=bm.asarray([0.0, self.cfg.height_target]),
-            vel=bm.zeros((2,)),
-            angle=bm.asarray(0.0),
-            omega=bm.asarray(0.0),
-            hip_angle=bm.zeros((self.n_legs,)) + hip0,
-            knee_angle=bm.zeros((self.n_legs,)) + knee0,
-            hip_omega=bm.zeros((self.n_legs,)),
-            knee_omega=bm.zeros((self.n_legs,)),
+            pos=jnp.asarray([0.0, self.cfg.height_target]),
+            vel=jnp.zeros((2,)),
+            angle=jnp.asarray(0.0),
+            omega=jnp.asarray(0.0),
+            hip_angle=jnp.zeros((self.n_legs,)) + hip0,
+            knee_angle=jnp.zeros((self.n_legs,)) + knee0,
+            hip_omega=jnp.zeros((self.n_legs,)),
+            knee_omega=jnp.zeros((self.n_legs,)),
         )
 
     def sense(self, state: WalkerState) -> WalkerSensors:
@@ -314,19 +314,19 @@ class WalkerPhysics:
 
         hip_torque = self.cfg.hip_kp * (hip_target - state.hip_angle)
         hip_torque = hip_torque - self.cfg.hip_kd * state.hip_omega
-        hip_torque = bm.clip(
+        hip_torque = jnp.clip(
             hip_torque, -self.cfg.hip_torque_limit, self.cfg.hip_torque_limit
         )
 
         knee_torque = self.cfg.knee_kp * (knee_target - state.knee_angle)
         knee_torque = knee_torque - self.cfg.knee_kd * state.knee_omega
-        knee_torque = bm.clip(
+        knee_torque = jnp.clip(
             knee_torque, -self.cfg.knee_torque_limit, self.cfg.knee_torque_limit
         )
 
-        generalized_torque = bm.concatenate(
+        generalized_torque = jnp.concatenate(
             [
-                bm.asarray(
+                jnp.asarray(
                     [
                         -self.cfg.drag * state.vel[0],
                         -self.cfg.drag * state.vel[1],
@@ -339,20 +339,19 @@ class WalkerPhysics:
             axis=0,
         )
 
-        reg = 1e-5 * bm.eye(mass_matrix.shape[0])
-        qdd = bm.linalg.solve(
+        reg = 1e-5 * jnp.eye(mass_matrix.shape[0])
+        qdd = jnp.linalg.solve(
             mass_matrix + reg, generalized_torque + contact_force - bias
         )
 
-        dt = bm.get_dt() / 1000.0
-        qd_new = qd + qdd * dt
-        q_new = q + qd_new * dt
+        qd_new = qd + qdd * self.dt
+        q_new = q + qd_new * self.dt
 
         q_new = q_new.at[3 : 3 + self.n_legs].set(
-            bm.clip(q_new[3 : 3 + self.n_legs], -self.cfg.hip_limit, self.cfg.hip_limit)
+            jnp.clip(q_new[3 : 3 + self.n_legs], -self.cfg.hip_limit, self.cfg.hip_limit)
         )
         q_new = q_new.at[3 + self.n_legs : 3 + 2 * self.n_legs].set(
-            bm.clip(
+            jnp.clip(
                 q_new[3 + self.n_legs : 3 + 2 * self.n_legs],
                 self.cfg.knee_min,
                 self.cfg.knee_max,
@@ -360,13 +359,13 @@ class WalkerPhysics:
         )
 
         qd_new = qd_new.at[3 : 3 + self.n_legs].set(
-            bm.where(
-                bm.logical_or(
-                    bm.logical_and(
+            jnp.where(
+                jnp.logical_or(
+                    jnp.logical_and(
                         q_new[3 : 3 + self.n_legs] <= -self.cfg.hip_limit + 1e-6,
                         qd_new[3 : 3 + self.n_legs] < 0.0,
                     ),
-                    bm.logical_and(
+                    jnp.logical_and(
                         q_new[3 : 3 + self.n_legs] >= self.cfg.hip_limit - 1e-6,
                         qd_new[3 : 3 + self.n_legs] > 0.0,
                     ),
@@ -376,14 +375,14 @@ class WalkerPhysics:
             )
         )
         qd_new = qd_new.at[3 + self.n_legs : 3 + 2 * self.n_legs].set(
-            bm.where(
-                bm.logical_or(
-                    bm.logical_and(
+            jnp.where(
+                jnp.logical_or(
+                    jnp.logical_and(
                         q_new[3 + self.n_legs : 3 + 2 * self.n_legs]
                         <= self.cfg.knee_min + 1e-6,
                         qd_new[3 + self.n_legs : 3 + 2 * self.n_legs] < 0.0,
                     ),
-                    bm.logical_and(
+                    jnp.logical_and(
                         q_new[3 + self.n_legs : 3 + 2 * self.n_legs]
                         >= self.cfg.knee_max - 1e-6,
                         qd_new[3 + self.n_legs : 3 + 2 * self.n_legs] > 0.0,
@@ -402,7 +401,7 @@ class WalkerPhysics:
             foot_vel=sensed.foot_vel,
             ground_contact=sensed.ground_contact,
             total_ground_force=total_ground_force,
-            joint_torque=bm.stack([hip_torque, knee_torque], axis=1),
+            joint_torque=jnp.stack([hip_torque, knee_torque], axis=1),
         )
 
 

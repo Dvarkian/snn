@@ -32,7 +32,6 @@ import matplotlib.pyplot as plt
 
 
 _JAX_IMPORT_ERROR = None
-_BRAINPY_IMPORT_ERROR = None
 
 try:
     import jax
@@ -42,23 +41,15 @@ except Exception as exc:  # pragma: no cover - exercised only when runtime is mi
     jnp = None
     _JAX_IMPORT_ERROR = exc
 
-try:
-    import brainpy.math as bm
-except Exception as exc:  # pragma: no cover - exercised only when runtime is missing.
-    bm = None
-    _BRAINPY_IMPORT_ERROR = exc
-
 
 def _require_runtime():
     missing = []
     if jax is None:
         missing.append(f"jax ({_JAX_IMPORT_ERROR})")
-    if bm is None:
-        missing.append(f"brainpy ({_BRAINPY_IMPORT_ERROR})")
     if missing:
         raise ImportError(
             "trainable_system.py requires pip-installable Python packages. "
-            "Install at least: numpy matplotlib jax jaxlib brainpy brainpylib. "
+            "Install at least: numpy matplotlib jax jaxlib. "
             f"Missing runtime pieces: {', '.join(missing)}"
         )
 
@@ -68,7 +59,7 @@ def _import_walker_physics():
         from walking_physics import WalkerPhysics
     except Exception as exc:  # pragma: no cover - depends on optional runtime.
         raise ImportError(
-            "Unable to import walking_physics. Install BrainPy/JAX first, then retry."
+            "Unable to import walking_physics. Install JAX and its GPU dependencies first."
         ) from exc
     return WalkerPhysics
 
@@ -249,7 +240,6 @@ class TrainableWalkingSystem:
         self.num_steps = int(round(cfg.episode_ms / cfg.dt_ms))
         if self.num_steps < 1:
             raise ValueError("episode_ms must produce at least one simulation step.")
-        bm.set_dt(cfg.dt_ms)
 
         WalkerPhysics = _import_walker_physics()
         self.physics = WalkerPhysics(cfg)
