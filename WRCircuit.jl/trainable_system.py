@@ -118,9 +118,9 @@ class Config:
     # Task / training.
     target_vx: float = 0.40
     target_vy: float = 0.0
-    episode_ms: float = 1500.0
+    episode_ms: float = 5000.0
     dt_ms: float = 4.0
-    train_epochs: int = 300
+    train_epochs: int = 0
     learning_rate: float = 2e-3
     adam_beta1: float = 0.9
     adam_beta2: float = 0.999
@@ -861,9 +861,13 @@ def _training_worker(cfg: Config, features: np.ndarray, message_queue, stop_even
         _log("backend worker booting")
         system = TrainableWalkingSystem(cfg)
         refresh_every = cfg.vis_every if cfg.vis_every > 0 else cfg.eval_every
-        epoch_progress = TerminalProgressBar(max(1, cfg.train_epochs), "training epochs")
+        train_forever = cfg.train_epochs <= 0
+        total_epochs_label = "inf" if train_forever else str(cfg.train_epochs)
+        epoch_progress = (
+            None if train_forever else TerminalProgressBar(max(1, cfg.train_epochs), "training epochs")
+        )
         _log(
-            f"backend ready: epochs={cfg.train_epochs} refresh_every={refresh_every} "
+            f"backend ready: epochs={total_epochs_label} refresh_every={refresh_every} "
             f"es_population={cfg.es_population}"
         )
 
@@ -895,7 +899,7 @@ def _training_worker(cfg: Config, features: np.ndarray, message_queue, stop_even
         )
 
         epoch = 0
-        while epoch < cfg.train_epochs and not stop_event.is_set():
+        while not stop_event.is_set() and (train_forever or epoch < cfg.train_epochs):
             _queue_put_latest(
                 message_queue,
                 {
@@ -904,14 +908,15 @@ def _training_worker(cfg: Config, features: np.ndarray, message_queue, stop_even
                     "detail": "running optimizer step",
                 },
             )
-            _log(f"epoch {epoch + 1}/{cfg.train_epochs}: starting optimizer step")
+            _log(f"epoch {epoch + 1}/{total_epochs_label}: starting optimizer step")
             latest_metrics = system.train_step(
                 features,
-                progress_prefix=f"epoch {epoch + 1}/{cfg.train_epochs}",
+                progress_prefix=f"epoch {epoch + 1}/{total_epochs_label}",
             )
             epoch += 1
-            epoch_progress.update(epoch)
-            _log(f"epoch {epoch}/{cfg.train_epochs}: optimizer step complete {_metrics_summary(latest_metrics)}")
+            if epoch_progress is not None:
+                epoch_progress.update(epoch)
+            _log(f"epoch {epoch}/{total_epochs_label}: optimizer step complete {_metrics_summary(latest_metrics)}")
 
             _queue_put_latest(
                 message_queue,
@@ -924,9 +929,13 @@ def _training_worker(cfg: Config, features: np.ndarray, message_queue, stop_even
                 },
             )
 
-            should_refresh = epoch == 1 or epoch % max(1, refresh_every) == 0 or epoch >= cfg.train_epochs
+            should_refresh = (
+                epoch == 1
+                or epoch % max(1, refresh_every) == 0
+                or (not train_forever and epoch >= cfg.train_epochs)
+            )
             if should_refresh and not stop_event.is_set():
-                _log(f"epoch {epoch}/{cfg.train_epochs}: refreshing viewer rollout")
+                _log(f"epoch {epoch}/{total_epochs_label}: refreshing viewer rollout")
                 _queue_put_latest(
                     message_queue,
                     {
@@ -939,7 +948,7 @@ def _training_worker(cfg: Config, features: np.ndarray, message_queue, stop_even
                     features,
                     progress_label="refresh rollout",
                 )
-                _log(f"epoch {epoch}/{cfg.train_epochs}: refresh rollout complete {_metrics_summary(eval_metrics)}")
+                _log(f"epoch {epoch}/{total_epochs_label}: refresh rollout complete {_metrics_summary(eval_metrics)}")
                 _queue_put_latest(
                     message_queue,
                     {
@@ -948,20 +957,21 @@ def _training_worker(cfg: Config, features: np.ndarray, message_queue, stop_even
                         "rollout": rollout,
                         "metrics": eval_metrics,
                         "params": system.params,
-                        "phase": "idle" if epoch < cfg.train_epochs else "done",
+                        "phase": "idle",
                         "detail": "snapshot ready",
                     },
                 )
 
-        epoch_progress.finish()
-        _log(f"training worker finished at epoch {epoch}/{cfg.train_epochs}")
+        if epoch_progress is not None:
+            epoch_progress.finish()
+        _log(f"training worker finished at epoch {epoch}/{total_epochs_label}")
         _queue_put_latest(
             message_queue,
             {
                 "type": "done",
                 "epoch": epoch,
                 "phase": "done",
-                "detail": "training complete",
+                "detail": "training stopped" if stop_event.is_set() or train_forever else "training complete",
             },
         )
     except Exception as exc:  # pragma: no cover - worker-side runtime path.
@@ -1023,34 +1033,40 @@ class TrainingViewer:
         self.max_recurrent_edges = 420
         self.max_input_edges_per_channel = 5
         self.max_output_edges_per_command = 14
+        self.leg_colors = ["tab:blue", "tab:orange"]
+        self.rollout_cache: Dict[str, np.ndarray] = {}
+        self.hip_local = np.array(
+            [
+                [self.cfg.hip_x_offset, -0.5 * self.cfg.body_height],
+                [-self.cfg.hip_x_offset, -0.5 * self.cfg.body_height],
+            ],
+            dtype=float,
+        )
+        self.body_outline_local = np.array(
+            [
+                [0.5 * self.cfg.body_length, 0.5 * self.cfg.body_height],
+                [0.5 * self.cfg.body_length, -0.5 * self.cfg.body_height],
+                [-0.5 * self.cfg.body_length, -0.5 * self.cfg.body_height],
+                [-0.5 * self.cfg.body_length, 0.5 * self.cfg.body_height],
+                [0.5 * self.cfg.body_length, 0.5 * self.cfg.body_height],
+            ],
+            dtype=float,
+        )
 
         self.fig = plt.figure(figsize=(18, 10))
         outer = self.fig.add_gridspec(1, 2, width_ratios=[1.8, 0.95], wspace=0.24)
         self.ax_net = self.fig.add_subplot(outer[0, 0])
-        right = outer[0, 1].subgridspec(3, 1, height_ratios=[1.6, 0.9, 0.7], hspace=0.35)
+        right = outer[0, 1].subgridspec(2, 1, height_ratios=[1.7, 1.0], hspace=0.32)
         self.ax_robot = self.fig.add_subplot(right[0, 0])
         self.ax_metric = self.fig.add_subplot(right[1, 0])
-        self.ax_status = self.fig.add_subplot(right[2, 0])
 
         self._init_network_panel()
         self._init_robot_panel()
         self._init_metric_panel()
 
-        self._init_status_panel()
-        self.status_text = self.ax_status.text(
-            0.0,
-            0.74,
-            "",
-            va="top",
-            ha="left",
-            family="monospace",
-            fontsize=9,
-        )
-
         self.fig.canvas.mpl_connect("close_event", self._on_close)
 
         self._set_phase("starting", "viewer ready, waiting for backend")
-        self._refresh_status()
 
         self.anim_timer = self.fig.canvas.new_timer(
             interval=max(1, int(round(1000.0 / self.cfg.animation_fps)))
@@ -1061,7 +1077,7 @@ class TrainingViewer:
         self.train_timer.add_callback(self._on_train_tick)
 
     def _init_network_panel(self):
-        self.ax_net.set_facecolor("#07111f")
+        self.ax_net.set_facecolor("#ffffff")
         self.ax_net.set_xlim(0.0, 1.0)
         self.ax_net.set_ylim(0.0, 1.0)
         self.ax_net.set_aspect("equal", adjustable="box")
@@ -1076,16 +1092,16 @@ class TrainingViewer:
                 (0.24, 0.08),
                 0.52,
                 0.84,
-                facecolor="#0f1e31",
-                edgecolor="#284661",
+                facecolor="#f4f7fb",
+                edgecolor="#c5d0dc",
                 lw=1.4,
-                alpha=0.96,
+                alpha=1.0,
                 zorder=0,
             )
         )
-        self.ax_net.text(0.08, 0.96, "Inputs", ha="center", va="top", color="#91a7c2", fontsize=10)
-        self.ax_net.text(0.50, 0.96, "Recurrent Sheet", ha="center", va="top", color="#91a7c2", fontsize=10)
-        self.ax_net.text(0.92, 0.96, "Outputs", ha="center", va="top", color="#91a7c2", fontsize=10)
+        self.ax_net.text(0.08, 0.96, "Inputs", ha="center", va="top", color="#435569", fontsize=10)
+        self.ax_net.text(0.50, 0.96, "Recurrent Sheet", ha="center", va="top", color="#435569", fontsize=10)
+        self.ax_net.text(0.92, 0.96, "Outputs", ha="center", va="top", color="#435569", fontsize=10)
 
         self.input_node_positions = np.column_stack(
             [
@@ -1112,17 +1128,18 @@ class TrainingViewer:
                 label,
                 ha="left",
                 va="center",
-                color="#c4d3e3",
+                color="#2b3a48",
                 fontsize=6.8,
             )
         for idx, label in enumerate(self.system.action_labels):
+            label_color = self.leg_colors[idx % self.cfg.n_legs]
             self.ax_net.text(
                 0.985,
                 self.output_node_positions[idx, 1],
                 label,
                 ha="right",
                 va="center",
-                color="#c4d3e3",
+                color=label_color,
                 fontsize=8.0,
             )
         self.output_target_texts = [
@@ -1132,7 +1149,7 @@ class TrainingViewer:
                 "",
                 ha="center",
                 va="top",
-                color="#9eb2c9",
+                color=self.leg_colors[idx % self.cfg.n_legs],
                 fontsize=6.8,
                 family="monospace",
                 zorder=7,
@@ -1155,7 +1172,7 @@ class TrainingViewer:
             cmap="coolwarm",
             vmin=-2.0,
             vmax=2.0,
-            edgecolors="#dbe7f3",
+            edgecolors="#314252",
             linewidths=0.9,
             zorder=4,
         )
@@ -1167,7 +1184,7 @@ class TrainingViewer:
             cmap="coolwarm",
             vmin=-1.0,
             vmax=1.0,
-            edgecolors="#f2f5f8",
+            edgecolors="#314252",
             linewidths=1.1,
             zorder=4,
         )
@@ -1204,7 +1221,7 @@ class TrainingViewer:
             self.exc_canvas_positions[:, 1],
             s=np.zeros((self.system.n_exc,), dtype=float),
             facecolors="none",
-            edgecolors="#ffffff",
+            edgecolors="#111111",
             linewidths=np.zeros((self.system.n_exc,), dtype=float),
             zorder=6,
         )
@@ -1214,36 +1231,9 @@ class TrainingViewer:
             s=np.zeros((self.system.n_inh,), dtype=float),
             marker="s",
             facecolors="none",
-            edgecolors="#ffffff",
+            edgecolors="#111111",
             linewidths=np.zeros((self.system.n_inh,), dtype=float),
             zorder=6,
-        )
-
-        self.net_summary_text = self.ax_net.text(
-            0.26,
-            0.95,
-            "",
-            ha="left",
-            va="top",
-            color="#f4f7fb",
-            family="monospace",
-            fontsize=9,
-            zorder=7,
-        )
-        self.net_legend_text = self.ax_net.text(
-            0.26,
-            0.03,
-            (
-                "fill = membrane potential   size = filtered activity\n"
-                "white ring = spike   node outline = adaptation\n"
-                "circles = excitatory / I-O nodes   squares = inhibitory nodes\n"
-                "orange links = positive weights   blue links = negative weights"
-            ),
-            ha="left",
-            va="bottom",
-            color="#9eb2c9",
-            fontsize=8,
-            zorder=7,
         )
         self._update_network_weight_artists()
 
@@ -1256,15 +1246,21 @@ class TrainingViewer:
         self.path_line, = self.ax_robot.plot([], [], color="0.75", lw=1.5)
         self.body_box, = self.ax_robot.plot([], [], "-", color="black", lw=2)
         self.body_com, = self.ax_robot.plot([], [], "o", color="black", ms=4)
-        self.thighs = [self.ax_robot.plot([], [], "-", lw=2)[0] for _ in range(self.cfg.n_legs)]
-        self.shanks = [self.ax_robot.plot([], [], "-", lw=2)[0] for _ in range(self.cfg.n_legs)]
+        self.thighs = [
+            self.ax_robot.plot([], [], "-", lw=2, color=self.leg_colors[leg_idx])[0]
+            for leg_idx in range(self.cfg.n_legs)
+        ]
+        self.shanks = [
+            self.ax_robot.plot([], [], "-", lw=2, color=self.leg_colors[leg_idx])[0]
+            for leg_idx in range(self.cfg.n_legs)
+        ]
         self.knees = [
-            self.ax_robot.plot([], [], "o", color="tab:orange", ms=3)[0]
-            for _ in range(self.cfg.n_legs)
+            self.ax_robot.plot([], [], "o", color=self.leg_colors[leg_idx], ms=3)[0]
+            for leg_idx in range(self.cfg.n_legs)
         ]
         self.feet = [
-            self.ax_robot.plot([], [], "o", color="tab:blue", ms=4)[0]
-            for _ in range(self.cfg.n_legs)
+            self.ax_robot.plot([], [], "o", color=self.leg_colors[leg_idx], ms=4)[0]
+            for leg_idx in range(self.cfg.n_legs)
         ]
         self.force_line, = self.ax_robot.plot([], [], "-", color="tab:red", lw=2)
 
@@ -1277,13 +1273,7 @@ class TrainingViewer:
         self.ax_metric.grid(alpha=0.25)
 
     def _init_status_panel(self):
-        self.ax_status.set_xlim(0.0, 1.0)
-        self.ax_status.set_ylim(0.0, 1.0)
-        self.ax_status.axis("off")
-        self.ax_status.text(0.0, 0.98, "Status", va="top", ha="left", fontsize=10, fontweight="bold")
-        self.phase_text = self.ax_status.text(
-            0.0, 0.88, "", va="top", ha="left", family="monospace", fontsize=9
-        )
+        return None
 
     def _controller_to_canvas(self, positions: np.ndarray) -> np.ndarray:
         positions = np.asarray(positions, dtype=float)
@@ -1514,18 +1504,6 @@ class TrainingViewer:
             text.set_text(f"{target_values[idx]:+.2f} rad")
 
         self._refresh_network_edge_styles(obs, action, filtered)
-        self.net_summary_text.set_text(
-            "\n".join(
-                [
-                    f"t={t_ms:6.0f} ms",
-                    f"mean membrane : {np.mean(membrane): .3f}",
-                    f"mean filtered : {np.mean(filtered): .3f}",
-                    f"spike rate    : {np.mean(spike): .3f}",
-                    f"input |obs|   : {np.mean(np.abs(obs)): .3f}",
-                    f"output |act|  : {np.mean(np.abs(action)): .3f}",
-                ]
-            )
-        )
 
     def _set_phase(self, phase: str, detail: str):
         self.current_phase = phase
@@ -1619,9 +1597,27 @@ class TrainingViewer:
         self.frame_times = ts_ms[frame_indices]
         self.frame_ptr = 0
 
-        membrane = np.asarray(rollout["v"], dtype=float)
-        filtered = np.asarray(rollout["filtered_spike"], dtype=float)
-        adapt = np.asarray(rollout["adapt"], dtype=float)
+        self.rollout_cache = {
+            key: np.asarray(rollout[key], dtype=float)
+            for key in (
+                "pos",
+                "angle",
+                "hip_angle",
+                "knee_angle",
+                "foot_pos",
+                "force",
+                "obs",
+                "action",
+                "v",
+                "filtered_spike",
+                "adapt",
+                "spike",
+            )
+        }
+
+        membrane = self.rollout_cache["v"]
+        filtered = self.rollout_cache["filtered_spike"]
+        adapt = self.rollout_cache["adapt"]
         v_lo = float(min(0.0, np.percentile(membrane, 1.0)))
         v_hi = float(max(self.cfg.v_th, np.percentile(membrane, 99.0)))
         self.exc_nodes.set_clim(v_lo, v_hi)
@@ -1629,8 +1625,8 @@ class TrainingViewer:
         self.filtered_node_scale = float(max(1.0, np.percentile(filtered, 99.0)))
         self.adapt_node_scale = float(max(1.0, np.percentile(adapt, 99.0)))
 
-        pos = np.asarray(rollout["pos"], dtype=float)
-        foot_pos = np.asarray(rollout["foot_pos"], dtype=float)
+        pos = self.rollout_cache["pos"]
+        foot_pos = self.rollout_cache["foot_pos"]
         min_y = float(
             min(
                 np.min(pos[:, 1]) - self.cfg.body_height,
@@ -1652,7 +1648,7 @@ class TrainingViewer:
         )
         self.ax_robot.set_ylim(*self.robot_y_limits)
         self.force_scale = 0.35 * self.cfg.body_length / max(
-            1.0, float(np.max(np.linalg.norm(np.asarray(rollout["force"], dtype=float), axis=1)))
+            1.0, float(np.max(np.linalg.norm(self.rollout_cache["force"], axis=1)))
         )
         self._draw_frame(0)
 
@@ -1663,19 +1659,18 @@ class TrainingViewer:
         self.frame_ptr = frame_ptr
         i = int(self.frame_indices[frame_ptr])
 
-        rollout = self.latest_rollout
-        pos = np.asarray(rollout["pos"], dtype=float)
-        angle = np.asarray(rollout["angle"], dtype=float)
-        hip_angle = np.asarray(rollout["hip_angle"], dtype=float)
-        knee_angle = np.asarray(rollout["knee_angle"], dtype=float)
-        foot_pos = np.asarray(rollout["foot_pos"], dtype=float)
-        force = np.asarray(rollout["force"], dtype=float)
-        obs = np.asarray(rollout["obs"], dtype=float)
-        action = np.asarray(rollout["action"], dtype=float)
-        membrane = np.asarray(rollout["v"], dtype=float)
-        filtered = np.asarray(rollout["filtered_spike"], dtype=float)
-        adapt = np.asarray(rollout["adapt"], dtype=float)
-        spike = np.asarray(rollout["spike"], dtype=float)
+        pos = self.rollout_cache["pos"]
+        angle = self.rollout_cache["angle"]
+        hip_angle = self.rollout_cache["hip_angle"]
+        knee_angle = self.rollout_cache["knee_angle"]
+        foot_pos = self.rollout_cache["foot_pos"]
+        force = self.rollout_cache["force"]
+        obs = self.rollout_cache["obs"]
+        action = self.rollout_cache["action"]
+        membrane = self.rollout_cache["v"]
+        filtered = self.rollout_cache["filtered_spike"]
+        adapt = self.rollout_cache["adapt"]
+        spike = self.rollout_cache["spike"]
         self._update_neural_canvas(
             self.frame_times[frame_ptr],
             obs[i],
@@ -1688,25 +1683,8 @@ class TrainingViewer:
 
         p = pos[i]
         theta = float(angle[i])
-        hip_local = np.array(
-            [
-                [self.cfg.hip_x_offset, -0.5 * self.cfg.body_height],
-                [-self.cfg.hip_x_offset, -0.5 * self.cfg.body_height],
-            ],
-            dtype=float,
-        )
-        body_outline_local = np.array(
-            [
-                [0.5 * self.cfg.body_length, 0.5 * self.cfg.body_height],
-                [0.5 * self.cfg.body_length, -0.5 * self.cfg.body_height],
-                [-0.5 * self.cfg.body_length, -0.5 * self.cfg.body_height],
-                [-0.5 * self.cfg.body_length, 0.5 * self.cfg.body_height],
-                [0.5 * self.cfg.body_length, 0.5 * self.cfg.body_height],
-            ],
-            dtype=float,
-        )
-        hip_pos = self._world_points(hip_local, p, theta)
-        body_outline = self._world_points(body_outline_local, p, theta)
+        hip_pos = self._world_points(self.hip_local, p, theta)
+        body_outline = self._world_points(self.body_outline_local, p, theta)
 
         self.path_line.set_data(pos[: i + 1, 0], pos[: i + 1, 1])
         self.body_box.set_data(body_outline[:, 0], body_outline[:, 1])
@@ -1735,40 +1713,7 @@ class TrainingViewer:
         )
 
     def _refresh_status(self):
-        elapsed = time.perf_counter() - self.start_time
-        self.phase_text.set_text(f"{self.current_phase:<10} {self.phase_detail}")
-        playback_frame = 0 if len(self.frame_indices) <= 1 else self.frame_ptr + 1
-        playback_total = max(1, len(self.frame_indices))
-        metric_lines = (
-            [
-                f"loss           : {self.history_loss[-1]: .4f}" if self.history_loss else "loss           : n/a",
-                f"distance       : {self.latest_metrics['distance']: .4f}",
-                f"mean vx        : {self.latest_metrics['mean_vx']: .4f}",
-                f"reward         : {self.latest_metrics['reward']: .4f}",
-                f"height error   : {self.latest_metrics['height_error']: .4f}",
-                f"pitch error    : {self.latest_metrics['pitch_error']: .4f}",
-            ]
-            if self.latest_metrics is not None
-            else [
-                "loss           : compiling / waiting",
-                "distance       : n/a",
-                "mean vx        : n/a",
-                "reward         : n/a",
-                "height error   : n/a",
-                "pitch error    : n/a",
-            ]
-        )
-        self.status_text.set_text(
-            "\n".join(
-                [
-                    f"epoch          : {self.epoch:4d} / {self.cfg.train_epochs}",
-                    *metric_lines,
-                    f"playback frame : {playback_frame:4d} / {playback_total}",
-                    f"tick count     : {self.train_tick_count:6d}",
-                    f"elapsed        : {elapsed:6.1f} s",
-                ]
-            )
-        )
+        return None
 
     def _refresh_metric_plot(self):
         if not self.history_steps:
@@ -1796,8 +1741,6 @@ class TrainingViewer:
             return
         next_ptr = (self.frame_ptr + 1) % len(self.frame_indices)
         self._draw_frame(next_ptr)
-        if self.current_phase == "idle":
-            self._refresh_status()
         self.fig.canvas.draw_idle()
 
     def _on_train_tick(self):
@@ -1815,9 +1758,10 @@ class TrainingViewer:
         if changed:
             now = time.perf_counter()
             if self.latest_metrics is not None and (now - self.last_log_time) >= 0.5:
+                total_epochs_label = "inf" if self.cfg.train_epochs <= 0 else str(self.cfg.train_epochs)
                 print(
                     "[trainable_system] "
-                    f"epoch={self.epoch}/{self.cfg.train_epochs} "
+                    f"epoch={self.epoch}/{total_epochs_label} "
                     f"phase={self.current_phase} "
                     f"loss={self.latest_metrics['loss']:.4f} "
                     f"distance={self.latest_metrics['distance']:.4f} "
@@ -1826,7 +1770,6 @@ class TrainingViewer:
                 )
                 self.last_log_time = now
         self._refresh_metric_plot()
-        self._refresh_status()
         self.fig.canvas.draw_idle()
 
     def show(self):
