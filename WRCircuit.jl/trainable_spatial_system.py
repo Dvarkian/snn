@@ -53,9 +53,9 @@ def _require_runtime():
 
 
 def _compatible_spatial_connectivity(cfg: Config) -> dict[str, int]:
-    ne = max(1, int(round(np.sqrt(cfg.rho * cfg.controller_dx_mm**2))))
-    ne_total = ne * ne
-    ni = max(1, int(round(ne_total / cfg.gamma)))
+    exc_side = max(1, int(round(np.sqrt(cfg.rho * cfg.controller_dx_mm**2))))
+    n_exc = exc_side * exc_side
+    n_inh = max(1, int(round(n_exc / cfg.gamma)))
 
     requested = {
         "K_ee": 260,
@@ -63,11 +63,18 @@ def _compatible_spatial_connectivity(cfg: Config) -> dict[str, int]:
         "K_ie": 225,
         "K_ii": 290,
     }
+
+    # Spatial.build_csr() ultimately samples exactly:
+    #   E2E: K_ee * n_exc   from n_exc * n_exc possible edges
+    #   E2I: K_ei * n_inh   from n_exc * n_inh
+    #   I2E: K_ie * n_exc   from n_inh * n_exc
+    #   I2I: K_ii * n_inh   from n_inh * n_inh
+    # so these are the true safe maxima for the compact controller size.
     limits = {
-        "K_ee": max(1, (ne_total * ne_total) // ne),
-        "K_ei": max(1, ne_total),
-        "K_ie": max(1, (ni * ne_total) // ne),
-        "K_ii": max(1, ni),
+        "K_ee": max(1, n_exc),
+        "K_ei": max(1, n_exc),
+        "K_ie": max(1, n_inh),
+        "K_ii": max(1, n_inh),
     }
     return {name: int(min(requested[name], limits[name])) for name in requested}
 
