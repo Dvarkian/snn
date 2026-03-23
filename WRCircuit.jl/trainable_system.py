@@ -1070,7 +1070,6 @@ class TrainingViewer:
         self.ax_net.set_yticks([])
         for spine in self.ax_net.spines.values():
             spine.set_visible(False)
-        self.ax_net.set_title("Spatial SNN Controller", loc="left", color="#e8eef7", fontsize=14, pad=10)
 
         self.ax_net.add_patch(
             plt.Rectangle(
@@ -1126,6 +1125,20 @@ class TrainingViewer:
                 color="#c4d3e3",
                 fontsize=8.0,
             )
+        self.output_target_texts = [
+            self.ax_net.text(
+                self.output_node_positions[idx, 0],
+                self.output_node_positions[idx, 1] - 0.040,
+                "",
+                ha="center",
+                va="top",
+                color="#9eb2c9",
+                fontsize=6.8,
+                family="monospace",
+                zorder=7,
+            )
+            for idx in range(self.system.action_size)
+        ]
 
         self.rec_lines = LineCollection([], zorder=1, capstyle="round", joinstyle="round")
         self.input_lines = LineCollection([], zorder=2, capstyle="round")
@@ -1223,7 +1236,8 @@ class TrainingViewer:
             (
                 "fill = membrane potential   size = filtered activity\n"
                 "white ring = spike   node outline = adaptation\n"
-                "left/right fibers = strongest input/output weights   center fibers = strongest recurrent weights"
+                "circles = excitatory / I-O nodes   squares = inhibitory nodes\n"
+                "orange links = positive weights   blue links = negative weights"
             ),
             ha="left",
             va="bottom",
@@ -1493,6 +1507,11 @@ class TrainingViewer:
         self.output_nodes.set_array(action)
         self.input_nodes.set_sizes(42.0 + 150.0 * np.clip(np.abs(obs) / 2.0, 0.0, 1.0))
         self.output_nodes.set_sizes(78.0 + 220.0 * np.clip(np.abs(action), 0.0, 1.0))
+
+        hip_target, knee_target = self.system._decode_targets(action.astype(np.float32))
+        target_values = np.concatenate([hip_target, knee_target], axis=0)
+        for idx, text in enumerate(self.output_target_texts):
+            text.set_text(f"{target_values[idx]:+.2f} rad")
 
         self._refresh_network_edge_styles(obs, action, filtered)
         self.net_summary_text.set_text(
