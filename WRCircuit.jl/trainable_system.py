@@ -57,7 +57,8 @@ def _require_runtime():
         missing.append(f"brainpy ({_BRAINPY_IMPORT_ERROR})")
     if missing:
         raise ImportError(
-            "trainable_system.py requires the Conda environment from CondaPkg.toml. "
+            "trainable_system.py requires pip-installable Python packages. "
+            "Install at least: numpy matplotlib jax jaxlib brainpy brainpylib. "
             f"Missing runtime pieces: {', '.join(missing)}"
         )
 
