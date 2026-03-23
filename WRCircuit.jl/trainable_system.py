@@ -56,6 +56,26 @@ def _require_runtime():
         )
 
 
+def _choose_compute_device():
+    force_gpu = os.environ.get("TRAINABLE_SYSTEM_USE_GPU", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    try:
+        cpu_device = jax.devices("cpu")[0]
+    except Exception:
+        cpu_device = jax.devices()[0]
+
+    if force_gpu:
+        try:
+            return jax.devices("gpu")[0], "gpu"
+        except Exception:
+            return cpu_device, "cpu"
+    return cpu_device, "cpu"
+
+
 def _import_walker_physics():
     try:
         from walking_physics import WalkerPhysics
@@ -277,6 +297,7 @@ class TrainableWalkingSystem:
         self.num_steps = int(round(cfg.episode_ms / cfg.dt_ms))
         if self.num_steps < 1:
             raise ValueError("episode_ms must produce at least one simulation step.")
+        self.compute_device, self.compute_backend = _choose_compute_device()
 
         WalkerPhysics = _import_walker_physics()
         self.physics = WalkerPhysics(cfg)
@@ -381,9 +402,13 @@ class TrainableWalkingSystem:
 
         self.params = self._init_params(param_key)
         self.opt_state = self._adam_init(self.params)
-        self._compiled_rollout_and_metrics = jax.jit(self._rollout_and_metrics)
+        self._compiled_rollout_and_metrics = jax.jit(
+            self._rollout_and_metrics,
+            device=self.compute_device,
+        )
         self._compiled_loss_and_grad = jax.jit(
-            jax.value_and_grad(self._loss_and_metrics, has_aux=True)
+            jax.value_and_grad(self._loss_and_metrics, has_aux=True),
+            device=self.compute_device,
         )
 
     def _init_params(self, key):
@@ -752,7 +777,8 @@ class TrainableWalkingSystem:
         return loss, metrics
 
     def train_step(self, features: Optional[np.ndarray] = None) -> Dict[str, float]:
-        features = self._coerce_features(features)
+        features = jax.device_put(self._coerce_features(features), self.compute_device)
+        self.params = jax.device_put(self.params, self.compute_device)
         (loss, metrics), grads = self._compiled_loss_and_grad(self.params, features)
         loss = jax.block_until_ready(loss)
         grad_norm = _tree_global_norm(grads)
@@ -766,7 +792,8 @@ class TrainableWalkingSystem:
         return python_metrics
 
     def evaluate(self, features: Optional[np.ndarray] = None):
-        features = self._coerce_features(features)
+        features = jax.device_put(self._coerce_features(features), self.compute_device)
+        self.params = jax.device_put(self.params, self.compute_device)
         rollout, metrics = self._compiled_rollout_and_metrics(self.params, features)
         rollout["pos"].block_until_ready()
         return _tree_to_numpy(rollout), _python_metrics(metrics)
@@ -774,7 +801,8 @@ class TrainableWalkingSystem:
     def evaluate_with_progress(
         self, features: Optional[np.ndarray] = None, progress_label: str = "rollout"
     ):
-        features = self._coerce_features(features)
+        features = jax.device_put(self._coerce_features(features), self.compute_device)
+        self.params = jax.device_put(self.params, self.compute_device)
         progress = TerminalProgressBar(3, progress_label)
         progress.update(1)
         rollout, metrics = self._compiled_rollout_and_metrics(self.params, features)
@@ -1278,7 +1306,8 @@ def main():
     system = TrainableWalkingSystem(cfg)
     print(
         "[trainable_system] system ready "
-        f"(steps={system.num_steps}, exc={system.n_exc}, inh={system.n_inh})",
+        f"(steps={system.num_steps}, exc={system.n_exc}, inh={system.n_inh}, "
+        f"backend={system.compute_backend})",
         flush=True,
     )
     features = build_feature_sequence(
