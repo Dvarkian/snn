@@ -1,3 +1,27 @@
+"""
+From CondaPkg.toml, the stated Python/Conda-side requirements are:
+
+python == 3.11
+numpy < 2
+matplotlib
+networkx == 3.4
+graphviz == 2.50
+ipykernel
+cuda-nvcc >= 12.1
+cudnn >= 9.1, < 10
+nccl >= 2.18
+
+brainpy == 2.6.0
+brainpylib == 0.3.1
+pathos
+jax == 0.4.29
+jaxlib @ https://storage.googleapis.com/jax-releases/cuda12/jaxlib-0.4.29+cuda12.cudnn91-cp311-cp311-manylinux2014_x86_64.whl
+pymunk
+taichi == 1.7.0
+
+"""
+
+
 import warnings
 import brainpy as bp
 import brainpy.math as bm
