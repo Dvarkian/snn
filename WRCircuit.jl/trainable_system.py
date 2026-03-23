@@ -336,6 +336,30 @@ class TrainableWalkingSystem:
         self.n_total = self.n_exc + self.n_inh
         self.obs_size = 21
         self.action_size = 2 * cfg.n_legs
+        self.observation_labels = [
+            "target vx",
+            "target vy",
+            "body y",
+            "vel x",
+            "vel y",
+            "pitch",
+            "omega",
+            "hip 0",
+            "hip 1",
+            "knee 0",
+            "knee 1",
+            "hip w0",
+            "hip w1",
+            "knee w0",
+            "knee w1",
+            "foot y0",
+            "foot y1",
+            "foot vx0",
+            "foot vx1",
+            "contact 0",
+            "contact 1",
+        ]
+        self.action_labels = ["hip 0", "hip 1", "knee 0", "knee 1"]
 
         self.exc_positions = _grid_positions(self.exc_side, cfg.controller_dx_mm)
         key = jax.random.PRNGKey(cfg.random_seed)
@@ -597,8 +621,12 @@ class TrainableWalkingSystem:
         ground_contact = []
         force = []
         joint_torque = []
+        obs_hist = []
         action_hist = []
         spike_hist = []
+        v_hist = []
+        syn_hist = []
+        adapt_hist = []
         filt_hist = []
 
         for t in range(self.num_steps):
@@ -619,8 +647,12 @@ class TrainableWalkingSystem:
             ground_contact.append(np.asarray(sensed.ground_contact, dtype=np.float32))
             force.append(np.asarray(sensed.total_ground_force, dtype=np.float32))
             joint_torque.append(np.asarray(physics.last_joint_torque, dtype=np.float32))
+            obs_hist.append(obs)
             action_hist.append(action)
             spike_hist.append(ctrl_state["spike"])
+            v_hist.append(ctrl_state["v"])
+            syn_hist.append(ctrl_state["syn"])
+            adapt_hist.append(ctrl_state["adapt"])
             filt_hist.append(ctrl_state["filt"])
             if progress is not None and ((t + 1) % progress_stride == 0 or (t + 1) == self.num_steps):
                 progress.update(t + 1)
@@ -641,8 +673,12 @@ class TrainableWalkingSystem:
             "ground_contact": np.stack(ground_contact, axis=0).astype(np.float32),
             "force": np.stack(force, axis=0).astype(np.float32),
             "joint_torque": np.stack(joint_torque, axis=0).astype(np.float32),
+            "obs": np.stack(obs_hist, axis=0).astype(np.float32),
             "action": np.stack(action_hist, axis=0).astype(np.float32),
             "spike": spikes,
+            "v": np.stack(v_hist, axis=0).astype(np.float32),
+            "syn": np.stack(syn_hist, axis=0).astype(np.float32),
+            "adapt": np.stack(adapt_hist, axis=0).astype(np.float32),
             "filtered_spike": np.stack(filt_hist, axis=0).astype(np.float32),
             "E.spike": spikes[:, : self.n_exc],
             "I.spike": spikes[:, self.n_exc :],
@@ -851,6 +887,7 @@ def _training_worker(cfg: Config, features: np.ndarray, message_queue, stop_even
                 "epoch": 0,
                 "rollout": rollout,
                 "metrics": metrics,
+                "params": system.params,
                 "phase": "idle",
                 "detail": "ready to train",
             },
@@ -909,6 +946,7 @@ def _training_worker(cfg: Config, features: np.ndarray, message_queue, stop_even
                         "epoch": epoch,
                         "rollout": rollout,
                         "metrics": eval_metrics,
+                        "params": system.params,
                         "phase": "idle" if epoch < cfg.train_epochs else "done",
                         "detail": "snapshot ready",
                     },
@@ -979,28 +1017,49 @@ class TrainingViewer:
             0.5,
             self.cfg.body_length + self.cfg.thigh_length + self.cfg.shank_length + 0.2,
         )
+        self.latest_params = _tree_to_numpy(system.params)
 
-        self.fig = plt.figure(figsize=(14, 8))
-        gs = self.fig.add_gridspec(2, 2, width_ratios=[1.15, 1.0], hspace=0.30, wspace=0.28)
-        self.ax_net = self.fig.add_subplot(gs[:, 0])
-        right = gs[:, 1].subgridspec(3, 1, height_ratios=[1.6, 0.9, 0.7], hspace=0.35)
+        self.fig = plt.figure(figsize=(19, 10))
+        outer = self.fig.add_gridspec(
+            2,
+            3,
+            width_ratios=[1.15, 1.15, 0.95],
+            height_ratios=[1.0, 1.0],
+            hspace=0.24,
+            wspace=0.26,
+        )
+        left = outer[:, 0].subgridspec(3, 2, height_ratios=[1.0, 1.0, 0.95], hspace=0.38, wspace=0.30)
+        weights = outer[:, 1].subgridspec(3, 1, height_ratios=[1.0, 1.2, 0.95], hspace=0.38)
+        bottom_weights = weights[2, 0].subgridspec(1, 2, wspace=0.35)
+        right = outer[:, 2].subgridspec(3, 1, height_ratios=[1.6, 0.9, 0.7], hspace=0.35)
+        self.ax_spike = self.fig.add_subplot(left[0, 0])
+        self.ax_membrane = self.fig.add_subplot(left[0, 1])
+        self.ax_filtered = self.fig.add_subplot(left[1, 0])
+        self.ax_adapt = self.fig.add_subplot(left[1, 1])
+        self.ax_obs = self.fig.add_subplot(left[2, 0])
+        self.ax_action = self.fig.add_subplot(left[2, 1])
+        self.ax_w_in = self.fig.add_subplot(weights[0, 0])
+        self.ax_w_rec = self.fig.add_subplot(weights[1, 0])
+        self.ax_w_out = self.fig.add_subplot(bottom_weights[0, 0])
+        self.ax_rec_summary = self.fig.add_subplot(bottom_weights[0, 1])
         self.ax_robot = self.fig.add_subplot(right[0, 0])
         self.ax_metric = self.fig.add_subplot(right[1, 0])
         self.ax_status = self.fig.add_subplot(right[2, 0])
 
         self._init_network_panel()
+        self._init_weight_panel()
         self._init_robot_panel()
         self._init_metric_panel()
 
         self._init_status_panel()
         self.status_text = self.ax_status.text(
             0.0,
-            0.98,
+            0.74,
             "",
             va="top",
             ha="left",
             family="monospace",
-            fontsize=10,
+            fontsize=9,
         )
 
         self.fig.canvas.mpl_connect("close_event", self._on_close)
@@ -1017,8 +1076,9 @@ class TrainingViewer:
         self.train_timer.add_callback(self._on_train_tick)
 
     def _init_network_panel(self):
-        self.net_im = self.ax_net.imshow(
-            self.histograms[0].T,
+        zero_grid = np.zeros((self.system.exc_side, self.system.exc_side), dtype=float)
+        self.spike_im = self.ax_spike.imshow(
+            zero_grid.T,
             origin="lower",
             extent=[0.0, self.cfg.controller_dx_mm, 0.0, self.cfg.controller_dx_mm],
             interpolation="nearest",
@@ -1027,14 +1087,126 @@ class TrainingViewer:
             vmin=0.0,
             vmax=1.0,
         )
-        self.fig.colorbar(self.net_im, ax=self.ax_net, fraction=0.046, pad=0.04).set_label(
-            "Spike Count"
+        self.membrane_im = self.ax_membrane.imshow(
+            zero_grid.T,
+            origin="lower",
+            extent=[0.0, self.cfg.controller_dx_mm, 0.0, self.cfg.controller_dx_mm],
+            interpolation="nearest",
+            aspect="equal",
+            cmap="viridis",
+            vmin=0.0,
+            vmax=max(1.0, self.cfg.v_th),
         )
-        self.ax_net.set_aspect("equal", adjustable="box")
-        self.ax_net.set_box_aspect(1.0)
-        self.ax_net.set_title("Spatial Spiking Controller")
-        self.ax_net.set_xlabel("x (mm)")
-        self.ax_net.set_ylabel("y (mm)")
+        self.filtered_im = self.ax_filtered.imshow(
+            zero_grid.T,
+            origin="lower",
+            extent=[0.0, self.cfg.controller_dx_mm, 0.0, self.cfg.controller_dx_mm],
+            interpolation="nearest",
+            aspect="equal",
+            cmap="magma",
+            vmin=0.0,
+            vmax=1.0,
+        )
+        self.adapt_im = self.ax_adapt.imshow(
+            self.histograms[0].T,
+            origin="lower",
+            extent=[0.0, self.cfg.controller_dx_mm, 0.0, self.cfg.controller_dx_mm],
+            interpolation="nearest",
+            aspect="equal",
+            cmap="cividis",
+            vmin=0.0,
+            vmax=1.0,
+        )
+        for ax in (self.ax_spike, self.ax_membrane, self.ax_filtered, self.ax_adapt):
+            ax.set_aspect("equal", adjustable="box")
+            ax.set_box_aspect(1.0)
+            ax.set_xticks([])
+            ax.set_yticks([])
+        self.ax_spike.set_title("Spike Density")
+        self.ax_membrane.set_title("Membrane Potential")
+        self.ax_filtered.set_title("Filtered Activity")
+        self.ax_adapt.set_title("Adaptation")
+
+        obs_zero = np.zeros((self.system.obs_size,), dtype=float)
+        action_zero = np.zeros((self.system.action_size,), dtype=float)
+        self.obs_bar_y = np.arange(self.system.obs_size)
+        self.action_bar_y = np.arange(self.system.action_size)
+        self.obs_bars = self.ax_obs.barh(self.obs_bar_y, obs_zero, color="0.5", edgecolor="none")
+        self.action_bars = self.ax_action.barh(
+            self.action_bar_y, action_zero, color="0.5", edgecolor="none"
+        )
+        self.ax_obs.axvline(0.0, color="0.5", lw=1.0)
+        self.ax_action.axvline(0.0, color="0.5", lw=1.0)
+        self.ax_obs.set_title("Current Input Channels")
+        self.ax_action.set_title("Current Motor Commands")
+        self.ax_obs.set_yticks(self.obs_bar_y, labels=self.system.observation_labels, fontsize=7)
+        self.ax_action.set_yticks(self.action_bar_y, labels=self.system.action_labels, fontsize=8)
+        self.ax_obs.invert_yaxis()
+        self.ax_action.invert_yaxis()
+        self.ax_obs.set_xlim(-2.2, 2.2)
+        self.ax_action.set_xlim(-1.05, 1.05)
+        self.ax_obs.grid(alpha=0.20, axis="x")
+        self.ax_action.grid(alpha=0.20, axis="x")
+
+    def _init_weight_panel(self):
+        self.w_in_im = self.ax_w_in.imshow(
+            np.zeros((self.system.obs_size, self.system.n_total), dtype=float),
+            origin="lower",
+            interpolation="nearest",
+            aspect="auto",
+            cmap="coolwarm",
+            vmin=-1.0,
+            vmax=1.0,
+        )
+        self.ax_w_in.set_title("Input Weights Into SNN")
+        self.ax_w_in.set_ylabel("input channel")
+        self.ax_w_in.set_xticks([])
+        self.ax_w_in.set_yticks(np.arange(self.system.obs_size), labels=self.system.observation_labels, fontsize=7)
+
+        self.w_rec_im = self.ax_w_rec.imshow(
+            np.zeros((self.system.n_total, self.system.n_total), dtype=float),
+            origin="lower",
+            interpolation="nearest",
+            aspect="auto",
+            cmap="coolwarm",
+            vmin=-1.0,
+            vmax=1.0,
+        )
+        self.ax_w_rec.set_title("Recurrent Weights Within SNN")
+        self.ax_w_rec.set_xlabel("post neuron")
+        self.ax_w_rec.set_ylabel("pre neuron")
+        self.ax_w_rec.set_xticks([])
+        self.ax_w_rec.set_yticks([])
+
+        self.w_out_im = self.ax_w_out.imshow(
+            np.zeros((self.system.action_size, self.system.n_total), dtype=float),
+            origin="lower",
+            interpolation="nearest",
+            aspect="auto",
+            cmap="coolwarm",
+            vmin=-1.0,
+            vmax=1.0,
+        )
+        self.ax_w_out.set_title("Output Readout Weights")
+        self.ax_w_out.set_xlabel("neuron")
+        self.ax_w_out.set_yticks(np.arange(self.system.action_size), labels=self.system.action_labels, fontsize=8)
+        self.ax_w_out.set_xticks([])
+
+        self.rec_summary_im = self.ax_rec_summary.imshow(
+            np.zeros((self.system.exc_side, self.system.exc_side), dtype=float),
+            origin="lower",
+            interpolation="nearest",
+            aspect="equal",
+            cmap="magma",
+            vmin=0.0,
+            vmax=1.0,
+        )
+        self.ax_rec_summary.set_aspect("equal", adjustable="box")
+        self.ax_rec_summary.set_box_aspect(1.0)
+        self.ax_rec_summary.set_title("Incoming |W_rec| to E")
+        self.ax_rec_summary.set_xticks([])
+        self.ax_rec_summary.set_yticks([])
+        self._update_weight_views()
 
     def _init_robot_panel(self):
         self.ax_robot.set_aspect("equal", adjustable="box")
@@ -1071,8 +1243,46 @@ class TrainingViewer:
         self.ax_status.axis("off")
         self.ax_status.text(0.0, 0.98, "Status", va="top", ha="left", fontsize=10, fontweight="bold")
         self.phase_text = self.ax_status.text(
-            0.0, 0.86, "", va="top", ha="left", family="monospace", fontsize=9
+            0.0, 0.88, "", va="top", ha="left", family="monospace", fontsize=9
         )
+
+    def _exc_grid(self, values: np.ndarray) -> np.ndarray:
+        exc = np.asarray(values[: self.system.n_exc], dtype=float)
+        return exc.reshape(self.system.exc_side, self.system.exc_side)
+
+    def _bar_colors(self, values: np.ndarray, limit: float):
+        cmap = plt.get_cmap("coolwarm")
+        scale = max(1e-6, float(limit))
+        normalized = np.clip(0.5 + 0.5 * (values / scale), 0.0, 1.0)
+        return cmap(normalized)
+
+    def _update_bar_plot(self, bars, values: np.ndarray, limit: float):
+        values = np.asarray(values, dtype=float)
+        colors = self._bar_colors(values, limit)
+        for idx, bar in enumerate(bars):
+            bar.set_width(float(values[idx]))
+            bar.set_facecolor(colors[idx])
+
+    def _update_weight_views(self):
+        params = _tree_to_numpy(self.latest_params)
+        w_in = np.asarray(params["w_in"], dtype=float)
+        w_out = np.asarray(params["w_out"], dtype=float).T
+        w_rec = np.asarray(self.system._effective_recurrent_weights(params), dtype=float)
+        incoming_exc = np.sum(np.abs(w_rec[:, : self.system.n_exc]), axis=0)
+        incoming_exc = incoming_exc.reshape(self.system.exc_side, self.system.exc_side)
+
+        def _set_signed_image(image, values):
+            vmax = max(1e-6, float(np.percentile(np.abs(values), 99.0)))
+            image.set_data(values)
+            image.set_clim(-vmax, vmax)
+
+        _set_signed_image(self.w_in_im, w_in)
+        _set_signed_image(self.w_rec_im, w_rec)
+        _set_signed_image(self.w_out_im, w_out)
+
+        rec_vmax = max(1e-6, float(np.percentile(incoming_exc, 99.0)))
+        self.rec_summary_im.set_data(incoming_exc.T)
+        self.rec_summary_im.set_clim(0.0, rec_vmax)
 
     def _set_phase(self, phase: str, detail: str):
         self.current_phase = phase
@@ -1119,6 +1329,10 @@ class TrainingViewer:
 
             if msg_type == "snapshot":
                 self._record_metrics(int(message["epoch"]), message["metrics"])
+                if "params" in message and message["params"] is not None:
+                    self.latest_params = _tree_to_numpy(message["params"])
+                    self.system.params = self.latest_params
+                    self._update_weight_views()
                 self._set_rollout(message["rollout"], message["metrics"])
                 continue
 
@@ -1172,8 +1386,19 @@ class TrainingViewer:
             progress_label="preparing spike maps",
         )
         _log("viewer: spike maps ready")
-        vmax = max(1.0, float(np.max(self.histograms)))
-        self.net_im.set_clim(0.0, vmax)
+        spike_vmax = max(1.0, float(np.max(self.histograms)))
+        self.spike_im.set_clim(0.0, spike_vmax)
+
+        exc_v = np.asarray(rollout["v"][:, : self.system.n_exc], dtype=float)
+        exc_filt = np.asarray(rollout["filtered_spike"][:, : self.system.n_exc], dtype=float)
+        exc_adapt = np.asarray(rollout["adapt"][:, : self.system.n_exc], dtype=float)
+        v_lo = float(min(0.0, np.percentile(exc_v, 1.0)))
+        v_hi = float(max(self.cfg.v_th, np.percentile(exc_v, 99.0)))
+        filt_hi = float(max(1.0, np.percentile(exc_filt, 99.0)))
+        adapt_hi = float(max(1.0, np.percentile(exc_adapt, 99.0)))
+        self.membrane_im.set_clim(v_lo, v_hi)
+        self.filtered_im.set_clim(0.0, filt_hi)
+        self.adapt_im.set_clim(0.0, adapt_hi)
 
         pos = np.asarray(rollout["pos"], dtype=float)
         foot_pos = np.asarray(rollout["foot_pos"], dtype=float)
@@ -1216,11 +1441,28 @@ class TrainingViewer:
         knee_angle = np.asarray(rollout["knee_angle"], dtype=float)
         foot_pos = np.asarray(rollout["foot_pos"], dtype=float)
         force = np.asarray(rollout["force"], dtype=float)
+        obs = np.asarray(rollout["obs"], dtype=float)
+        action = np.asarray(rollout["action"], dtype=float)
+        membrane = np.asarray(rollout["v"], dtype=float)
+        filtered = np.asarray(rollout["filtered_spike"], dtype=float)
+        adapt = np.asarray(rollout["adapt"], dtype=float)
 
-        self.net_im.set_data(self.histograms[frame_ptr].T)
-        self.ax_net.set_title(
-            f"Spatial Spiking Controller | t={self.frame_times[frame_ptr]:.0f} ms"
+        self.spike_im.set_data(self.histograms[frame_ptr].T)
+        self.membrane_im.set_data(self._exc_grid(membrane[i]).T)
+        self.filtered_im.set_data(self._exc_grid(filtered[i]).T)
+        self.adapt_im.set_data(self._exc_grid(adapt[i]).T)
+        self.ax_spike.set_title(f"Spike Density | t={self.frame_times[frame_ptr]:.0f} ms")
+        self.ax_membrane.set_title(
+            f"Membrane Potential | mean={np.mean(membrane[i, : self.system.n_exc]):.3f}"
         )
+        self.ax_filtered.set_title(
+            f"Filtered Activity | mean={np.mean(filtered[i, : self.system.n_exc]):.3f}"
+        )
+        self.ax_adapt.set_title(
+            f"Adaptation | mean={np.mean(adapt[i, : self.system.n_exc]):.3f}"
+        )
+        self._update_bar_plot(self.obs_bars, obs[i], limit=2.0)
+        self._update_bar_plot(self.action_bars, action[i], limit=1.0)
 
         p = pos[i]
         theta = float(angle[i])
