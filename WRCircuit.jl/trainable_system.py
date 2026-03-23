@@ -123,8 +123,8 @@ class Config:
     # Task / training.
     target_vx: float = 0.40
     target_vy: float = 0.0
-    train_episode_ms: float = 5000.0
-    vis_episode_ms: float = 7500.0
+    train_episode_ms: float = 1500.0
+    vis_episode_ms: float = 1500.0
     dt_ms: float = 4.0
     train_epochs: Optional[int] = None
     learning_rate: float = 2e-3
