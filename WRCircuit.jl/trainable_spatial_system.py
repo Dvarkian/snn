@@ -135,11 +135,6 @@ class TrainableSpatialWalkingSystem(_BaseTrainableWalkingSystem):
             )
 
     @staticmethod
-    def _shape_tuple(shape) -> tuple[int, ...]:
-        values = np.atleast_1d(np.asarray(shape, dtype=int)).tolist()
-        return tuple(int(v) for v in values)
-
-    @staticmethod
     def _value_to_numpy(value) -> np.ndarray:
         if hasattr(value, "value"):
             value = value.value
@@ -148,6 +143,13 @@ class TrainableSpatialWalkingSystem(_BaseTrainableWalkingSystem):
     @staticmethod
     def _assign_input_var(input_var, value):
         target = getattr(input_var, "input", input_var)
+        if hasattr(target, "value"):
+            target_value = target.value
+        else:
+            target_value = target
+
+        target_shape = np.asarray(target_value).shape
+        value = np.asarray(value, dtype=np.float32).reshape(target_shape)
         if hasattr(target, "value"):
             target.value = bm.asarray(value)
         else:
@@ -252,8 +254,8 @@ class TrainableSpatialWalkingSystem(_BaseTrainableWalkingSystem):
     def _controller_step(self, params, ctrl_state, obs):
         obs = np.asarray(obs, dtype=np.float32)
         drive = self.cfg.input_gain * (obs @ params["w_in"]) + params["bias_in"]
-        e_drive = drive[: self.n_exc].reshape(self._shape_tuple(self.spatial_model.E.size))
-        i_drive = drive[self.n_exc :].reshape(self._shape_tuple(self.spatial_model.I.size))
+        e_drive = drive[: self.n_exc]
+        i_drive = drive[self.n_exc :]
 
         self._assign_input_var(self.spatial_model.Ein, e_drive.astype(np.float32))
         self._assign_input_var(self.spatial_model.Iin, i_drive.astype(np.float32))
