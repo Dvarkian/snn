@@ -29,7 +29,13 @@ def _ensure_writable_runtime_dirs():
         os.environ["MPLCONFIGDIR"] = mpl_config_dir
 
 
+def _configure_jax_runtime():
+    os.environ.setdefault("JAX_PLATFORMS", "cpu")
+    os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+
+
 _ensure_writable_runtime_dirs()
+_configure_jax_runtime()
 
 import matplotlib.pyplot as plt
 
@@ -117,7 +123,8 @@ class Config:
     # Task / training.
     target_vx: float = 0.40
     target_vy: float = 0.0
-    episode_ms: float = 7500.0
+    train_episode_ms: float = 5000.0
+    vis_episode_ms: float = 7500.0
     dt_ms: float = 4.0
     train_epochs: Optional[int] = None
     learning_rate: float = 2e-3
@@ -233,9 +240,11 @@ def _grid_positions(side: int, extent_mm: float) -> np.ndarray:
 def _tree_global_norm(tree) -> Any:
     leaves = jax.tree_util.tree_leaves(tree)
     if not leaves:
-        return jnp.asarray(0.0, dtype=jnp.float32)
-    total = sum(jnp.sum(jnp.square(x)) for x in leaves)
-    return jnp.sqrt(total + 1e-12)
+        return 0.0
+    total = 0.0
+    for leaf in leaves:
+        total += float(np.sum(np.square(np.asarray(leaf, dtype=np.float32))))
+    return float(np.sqrt(total + 1e-12))
 
 
 def _tree_to_numpy(tree):
@@ -332,9 +341,13 @@ class TrainableWalkingSystem:
             raise ValueError("TrainableWalkingSystem currently expects n_legs == 2.")
 
         self.cfg = cfg
-        self.num_steps = int(round(cfg.episode_ms / cfg.dt_ms))
-        if self.num_steps < 1:
-            raise ValueError("episode_ms must produce at least one simulation step.")
+        self.train_num_steps = int(round(cfg.train_episode_ms / cfg.dt_ms))
+        self.vis_num_steps = int(round(cfg.vis_episode_ms / cfg.dt_ms))
+        if self.train_num_steps < 1:
+            raise ValueError("train_episode_ms must produce at least one simulation step.")
+        if self.vis_num_steps < 1:
+            raise ValueError("vis_episode_ms must produce at least one simulation step.")
+        self.num_steps = self.train_num_steps
         self.compute_backend = "pymunk"
         self.rng = np.random.default_rng(cfg.random_seed)
 
@@ -352,18 +365,14 @@ class TrainableWalkingSystem:
         self.action_size = 2 * cfg.n_legs
 
         self.exc_positions = _grid_positions(self.exc_side, cfg.controller_dx_mm)
-        key = jax.random.PRNGKey(cfg.random_seed)
-        key, inh_key, mask_key, param_key = jax.random.split(key, 4)
-        inh_positions = np.asarray(
-            jax.random.uniform(
-                inh_key,
-                shape=(self.n_inh, 2),
-                minval=0.0,
-                maxval=cfg.controller_dx_mm,
-            )
-        )
-        self.all_positions = jnp.asarray(
-            np.concatenate([self.exc_positions, inh_positions], axis=0), dtype=jnp.float32
+        init_rng = np.random.default_rng(cfg.random_seed)
+        inh_positions = init_rng.uniform(
+            low=0.0,
+            high=cfg.controller_dx_mm,
+            size=(self.n_inh, 2),
+        ).astype(np.float32)
+        self.all_positions = np.concatenate([self.exc_positions, inh_positions], axis=0).astype(
+            np.float32
         )
 
         self.E = SimpleNamespace(
@@ -445,20 +454,19 @@ class TrainableWalkingSystem:
             dtype=np.float32,
         )
 
-        self.params = _tree_to_numpy(self._init_params(param_key))
+        self.params = _tree_to_numpy(self._init_params(init_rng))
         self.opt_state = self._adam_init(self.params)
 
-    def _init_params(self, key):
-        k1, k2, k3 = jax.random.split(key, 3)
+    def _init_params(self, rng):
         scale_in = 1.0 / np.sqrt(max(1, self.obs_size))
         scale_rec = 1.0 / np.sqrt(max(1, self.n_total))
         scale_out = 1.0 / np.sqrt(max(1, self.n_total))
         return {
-            "w_in": jax.random.normal(k1, (self.obs_size, self.n_total)) * scale_in,
-            "w_rec_raw": jax.random.normal(k2, (self.n_total, self.n_total)) * scale_rec,
-            "bias_rec": jnp.zeros((self.n_total,), dtype=jnp.float32),
-            "w_out": jax.random.normal(k3, (self.n_total, self.action_size)) * scale_out,
-            "bias_out": jnp.zeros((self.action_size,), dtype=jnp.float32),
+            "w_in": rng.standard_normal((self.obs_size, self.n_total)).astype(np.float32) * scale_in,
+            "w_rec_raw": rng.standard_normal((self.n_total, self.n_total)).astype(np.float32) * scale_rec,
+            "bias_rec": np.zeros((self.n_total,), dtype=np.float32),
+            "w_out": rng.standard_normal((self.n_total, self.action_size)).astype(np.float32) * scale_out,
+            "bias_out": np.zeros((self.action_size,), dtype=np.float32),
         }
 
     def _adam_init(self, params) -> AdamState:
@@ -575,30 +583,37 @@ class TrainableWalkingSystem:
         )
         return hip, knee
 
-    def _coerce_features(self, features: Optional[np.ndarray]) -> Any:
+    def _coerce_features(self, features: Optional[np.ndarray], num_steps: Optional[int] = None) -> Any:
+        if num_steps is None:
+            num_steps = self.train_num_steps
         if features is None:
             features = build_feature_sequence(
-                self.num_steps,
+                num_steps,
                 self.cfg.dt_ms,
                 self.cfg.target_vx,
                 self.cfg.target_vy,
             )
         features = np.asarray(features, dtype=np.float32)
-        if features.shape != (self.num_steps, 2):
+        if features.ndim != 2 or features.shape[1] != 2:
             raise ValueError(
-                f"Expected features with shape {(self.num_steps, 2)}, got {features.shape}."
+                f"Expected features with shape (num_steps, 2), got {features.shape}."
+            )
+        if features.shape[0] != num_steps:
+            raise ValueError(
+                f"Expected {num_steps} feature steps, got {features.shape[0]}."
             )
         return features
 
     def _simulate(self, params, features, progress_label: Optional[str] = None):
+        num_steps = int(features.shape[0])
         physics = self._make_physics()
         sensed = physics.observe()
         ctrl_state = self._controller_initial_state()
         progress = None
         progress_stride = None
         if progress_label:
-            progress = TerminalProgressBar(self.num_steps, progress_label)
-            progress_stride = max(1, self.num_steps // 40)
+            progress = TerminalProgressBar(num_steps, progress_label)
+            progress_stride = max(1, num_steps // 40)
 
         pos = []
         vel = []
@@ -615,7 +630,7 @@ class TrainableWalkingSystem:
         spike_hist = []
         filt_hist = []
 
-        for t in range(self.num_steps):
+        for t in range(num_steps):
             obs = self._build_observation(sensed, features[t])
             ctrl_state, action = self._controller_step(params, ctrl_state, obs)
             hip_target, knee_target = self._decode_targets(action)
@@ -643,7 +658,7 @@ class TrainableWalkingSystem:
         if progress is not None:
             progress.finish()
         return {
-            "ts": np.arange(self.num_steps, dtype=np.float32) * self.cfg.dt_ms,
+            "ts": np.arange(num_steps, dtype=np.float32) * self.cfg.dt_ms,
             "pos": np.stack(pos, axis=0).astype(np.float32),
             "vel": np.stack(vel, axis=0).astype(np.float32),
             "angle": np.stack(angle, axis=0).astype(np.float32),
@@ -719,7 +734,7 @@ class TrainableWalkingSystem:
         return loss, metrics
 
     def train_step(self, features: Optional[np.ndarray] = None, rollout_pool=None) -> Dict[str, float]:
-        features = self._coerce_features(features)
+        features = self._coerce_features(features, num_steps=self.train_num_steps)
         sigma = float(self.cfg.es_noise_std)
         population = max(1, int(self.cfg.es_population))
         grad_accum = jax.tree_util.tree_map(lambda p: np.zeros_like(p, dtype=np.float32), self.params)
@@ -772,7 +787,7 @@ class TrainableWalkingSystem:
         return metrics
 
     def evaluate(self, features: Optional[np.ndarray] = None):
-        features = self._coerce_features(features)
+        features = self._coerce_features(features, num_steps=self.vis_num_steps)
         rollout = self._simulate(self.params, features)
         _, metrics = self._metrics_from_rollout(rollout, features)
         return rollout, metrics
@@ -780,7 +795,7 @@ class TrainableWalkingSystem:
     def evaluate_with_progress(
         self, features: Optional[np.ndarray] = None, progress_label: str = "rollout"
     ):
-        features = self._coerce_features(features)
+        features = self._coerce_features(features, num_steps=self.vis_num_steps)
         rollout = self._simulate(self.params, features, progress_label=progress_label)
         _, metrics = self._metrics_from_rollout(rollout, features)
         return rollout, metrics
@@ -835,7 +850,13 @@ def prepare_spike_histograms_for_times(
     return histograms, domain
 
 
-def _training_worker(cfg: Config, features: np.ndarray, message_queue, stop_event):
+def _training_worker(
+    cfg: Config,
+    train_features: np.ndarray,
+    vis_features: np.ndarray,
+    message_queue,
+    stop_event,
+):
     rollout_pool = None
     try:
         system = TrainableWalkingSystem(cfg)
@@ -846,7 +867,7 @@ def _training_worker(cfg: Config, features: np.ndarray, message_queue, stop_even
             rollout_pool = ctx.Pool(
                 processes=rollout_workers,
                 initializer=_init_rollout_worker,
-                initargs=(cfg, features),
+                initargs=(cfg, train_features),
             )
         _queue_put_latest(
             message_queue,
@@ -869,7 +890,7 @@ def _training_worker(cfg: Config, features: np.ndarray, message_queue, stop_even
             },
         )
         rollout, metrics = system.evaluate_with_progress(
-            features,
+            vis_features,
             progress_label="initial rollout",
         )
         _queue_put_latest(
@@ -894,7 +915,7 @@ def _training_worker(cfg: Config, features: np.ndarray, message_queue, stop_even
                     "detail": "running optimizer step",
                 },
             )
-            latest_metrics = system.train_step(features, rollout_pool=rollout_pool)
+            latest_metrics = system.train_step(train_features, rollout_pool=rollout_pool)
             epoch += 1
 
             _queue_put_latest(
@@ -908,7 +929,7 @@ def _training_worker(cfg: Config, features: np.ndarray, message_queue, stop_even
                 },
             )
 
-            should_refresh = epoch == 1 or epoch % max(1, refresh_every) == 0
+            should_refresh = True
             if should_refresh and not stop_event.is_set():
                 _queue_put_latest(
                     message_queue,
@@ -919,7 +940,7 @@ def _training_worker(cfg: Config, features: np.ndarray, message_queue, stop_even
                     },
                 )
                 rollout, eval_metrics = system.evaluate_with_progress(
-                    features,
+                    vis_features,
                     progress_label="refresh rollout",
                 )
                 _queue_put_latest(
@@ -962,14 +983,16 @@ class TrainingViewer:
     def __init__(
         self,
         system: TrainableWalkingSystem,
-        features: np.ndarray,
+        train_features: np.ndarray,
+        vis_features: np.ndarray,
         message_queue,
         stop_event,
         worker_process,
     ):
         self.system = system
         self.cfg = system.cfg
-        self.features = features
+        self.train_features = train_features
+        self.vis_features = vis_features
         self.message_queue = message_queue
         self.stop_event = stop_event
         self.worker_process = worker_process
@@ -1013,12 +1036,12 @@ class TrainingViewer:
         self._init_status_panel()
         self.status_text = self.ax_status.text(
             0.0,
-            0.98,
+            0.02,
             "",
-            va="top",
+            va="bottom",
             ha="left",
             family="monospace",
-            fontsize=10,
+            fontsize=9,
         )
 
         self.fig.canvas.mpl_connect("close_event", self._on_close)
@@ -1085,19 +1108,19 @@ class TrainingViewer:
         self.ax_status.set_xlim(0.0, 1.0)
         self.ax_status.set_ylim(0.0, 1.0)
         self.ax_status.axis("off")
-        self.ax_status.text(0.0, 0.63, "Training", va="center", ha="left", fontsize=9)
-        self.ax_status.text(0.0, 0.44, "Playback", va="center", ha="left", fontsize=9)
-        self.ax_status.text(0.0, 0.25, "Phase", va="center", ha="left", fontsize=9)
-        self.train_bar_bg = plt.Rectangle((0.18, 0.58), 0.74, 0.08, color="0.9")
-        self.train_bar_fg = plt.Rectangle((0.18, 0.58), 0.0, 0.08, color="tab:blue")
-        self.play_bar_bg = plt.Rectangle((0.18, 0.39), 0.74, 0.08, color="0.9")
-        self.play_bar_fg = plt.Rectangle((0.18, 0.39), 0.0, 0.08, color="tab:orange")
+        self.ax_status.text(0.0, 0.82, "Train", va="center", ha="left", fontsize=9)
+        self.ax_status.text(0.0, 0.63, "Play", va="center", ha="left", fontsize=9)
+        self.ax_status.text(0.0, 0.43, "Phase", va="center", ha="left", fontsize=9)
+        self.train_bar_bg = plt.Rectangle((0.18, 0.77), 0.74, 0.08, color="0.9")
+        self.train_bar_fg = plt.Rectangle((0.18, 0.77), 0.0, 0.08, color="tab:blue")
+        self.play_bar_bg = plt.Rectangle((0.18, 0.58), 0.74, 0.08, color="0.9")
+        self.play_bar_fg = plt.Rectangle((0.18, 0.58), 0.0, 0.08, color="tab:orange")
         self.ax_status.add_patch(self.train_bar_bg)
         self.ax_status.add_patch(self.train_bar_fg)
         self.ax_status.add_patch(self.play_bar_bg)
         self.ax_status.add_patch(self.play_bar_fg)
         self.phase_text = self.ax_status.text(
-            0.18, 0.25, "", va="center", ha="left", family="monospace", fontsize=9
+            0.18, 0.43, "", va="center", ha="left", family="monospace", fontsize=9
         )
 
     def _set_phase(self, phase: str, detail: str):
@@ -1304,37 +1327,21 @@ class TrainingViewer:
         self.train_bar_fg.set_width(0.74 * train_progress)
         self.play_bar_fg.set_width(0.74 * play_progress)
         self.phase_text.set_text(f"{self.current_phase:<10} {self.phase_detail}")
-        metric_lines = (
-            [
-                f"loss           : {self.history_loss[-1]: .4f}" if self.history_loss else "loss           : n/a",
-                f"distance       : {self.latest_metrics['distance']: .4f}",
-                f"mean vx        : {self.latest_metrics['mean_vx']: .4f}",
-                f"reward         : {self.latest_metrics['reward']: .4f}",
-                f"height error   : {self.latest_metrics['height_error']: .4f}",
-                f"pitch error    : {self.latest_metrics['pitch_error']: .4f}",
+        if self.latest_metrics is None:
+            summary = [
+                f"epoch   {self.epoch:4d}  waiting for rollout",
+                "loss    n/a     reward  n/a",
+                "dist    n/a     vx      n/a",
+                f"time    {elapsed:6.1f}s  tick {self.train_tick_count:5d}",
             ]
-            if self.latest_metrics is not None
-            else [
-                "loss           : compiling / waiting",
-                "distance       : n/a",
-                "mean vx        : n/a",
-                "reward         : n/a",
-                "height error   : n/a",
-                "pitch error    : n/a",
+        else:
+            summary = [
+                f"epoch   {self.epoch:4d}  running",
+                f"loss    {self.latest_metrics['loss']: .3f}  reward {self.latest_metrics['reward']: .3f}",
+                f"dist    {self.latest_metrics['distance']: .3f}  vx     {self.latest_metrics['mean_vx']: .3f}",
+                f"time    {elapsed:6.1f}s  tick {self.train_tick_count:5d}",
             ]
-        )
-        self.status_text.set_text(
-            "\n".join(
-                [
-                    f"epoch          : {self.epoch:4d} (running until stopped)",
-                    *metric_lines,
-                    f"train status   : active ({100.0 * train_progress:6.2f} % pulse)",
-                    f"playback       : {100.0 * play_progress:6.2f} %",
-                    f"tick count     : {self.train_tick_count:6d}",
-                    f"elapsed        : {elapsed:6.1f} s",
-                ]
-            )
-        )
+        self.status_text.set_text("\n".join(summary))
 
     def _refresh_metric_plot(self):
         if not self.history_steps:
@@ -1360,7 +1367,7 @@ class TrainingViewer:
     def _on_anim_tick(self):
         if self.closed or self.latest_rollout is None:
             return
-        next_ptr = (self.frame_ptr + 1) % len(self.frame_indices)
+        next_ptr = min(self.frame_ptr + 1, len(self.frame_indices) - 1)
         self._draw_frame(next_ptr)
         if self.current_phase == "idle":
             self._refresh_status()
@@ -1408,12 +1415,19 @@ def main():
     system = TrainableWalkingSystem(cfg)
     print(
         "[trainable_system] system ready "
-        f"(steps={system.num_steps}, exc={system.n_exc}, inh={system.n_inh}, "
+        f"(train_steps={system.train_num_steps}, vis_steps={system.vis_num_steps}, "
+        f"exc={system.n_exc}, inh={system.n_inh}, "
         f"backend={system.compute_backend}, rollout_workers={_resolve_rollout_workers(cfg)})",
         flush=True,
     )
-    features = build_feature_sequence(
-        system.num_steps,
+    train_features = build_feature_sequence(
+        system.train_num_steps,
+        cfg.dt_ms,
+        cfg.target_vx,
+        cfg.target_vy,
+    )
+    vis_features = build_feature_sequence(
+        system.vis_num_steps,
         cfg.dt_ms,
         cfg.target_vx,
         cfg.target_vy,
@@ -1423,12 +1437,19 @@ def main():
     stop_event = ctx.Event()
     worker_process = ctx.Process(
         target=_training_worker,
-        args=(cfg, features, message_queue, stop_event),
+        args=(cfg, train_features, vis_features, message_queue, stop_event),
     )
     print("[trainable_system] starting backend worker...", flush=True)
     worker_process.start()
     print("[trainable_system] opening training viewer...", flush=True)
-    viewer = TrainingViewer(system, features, message_queue, stop_event, worker_process)
+    viewer = TrainingViewer(
+        system,
+        train_features,
+        vis_features,
+        message_queue,
+        stop_event,
+        worker_process,
+    )
     try:
         viewer.show()
     finally:
