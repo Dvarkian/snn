@@ -142,10 +142,17 @@ class PymunkPassiveWalker:
         self._walker_filter = pymunk.ShapeFilter(group=1)
         self._frame_impulse = pymunk.Vec2d(0.0, 0.0)
         self._foot_contact_count = [0 for _ in range(cfg.n_legs)]
+        self.hip_targets = np.zeros((cfg.n_legs,), dtype=float)
+        self.knee_targets = np.zeros((cfg.n_legs,), dtype=float)
+        self.last_joint_torque = np.zeros((cfg.n_legs, 2), dtype=float)
 
         self._build_ground()
         self._build_walker()
         self._register_collision_callbacks()
+
+    def set_targets(self, hip_target: np.ndarray, knee_target: np.ndarray):
+        self.hip_targets = np.asarray(hip_target, dtype=float).reshape(self.cfg.n_legs)
+        self.knee_targets = np.asarray(knee_target, dtype=float).reshape(self.cfg.n_legs)
 
     def _build_ground(self):
         extent = float(getattr(self.cfg, "ground_extent", 1000.0))
@@ -351,6 +358,7 @@ class PymunkPassiveWalker:
 
     def _apply_joint_torques(self):
         cfg = self.cfg
+        torques = np.zeros((cfg.n_legs, 2), dtype=float)
         for leg_idx in range(cfg.n_legs):
             thigh = self.thigh_bodies[leg_idx]
             shank = self.shank_bodies[leg_idx]
@@ -360,8 +368,14 @@ class PymunkPassiveWalker:
             hip_omega = float(thigh.angular_velocity - self.body.angular_velocity)
             knee_omega = float(shank.angular_velocity - thigh.angular_velocity)
 
-            hip_tau = cfg.hip_kp * (0.0 - hip_angle) - cfg.hip_kd * hip_omega
-            knee_tau = cfg.knee_kp * (0.0 - knee_angle) - cfg.knee_kd * knee_omega
+            hip_tau = (
+                cfg.hip_kp * (self.hip_targets[leg_idx] - hip_angle)
+                - cfg.hip_kd * hip_omega
+            )
+            knee_tau = (
+                cfg.knee_kp * (self.knee_targets[leg_idx] - knee_angle)
+                - cfg.knee_kd * knee_omega
+            )
             hip_tau = float(
                 np.clip(hip_tau, -cfg.hip_torque_limit, cfg.hip_torque_limit)
                 - cfg.joint_drag * hip_omega
@@ -374,12 +388,19 @@ class PymunkPassiveWalker:
             self.body.torque -= hip_tau
             thigh.torque += hip_tau - knee_tau
             shank.torque += knee_tau
+            torques[leg_idx, 0] = hip_tau
+            torques[leg_idx, 1] = knee_tau
+        return torques
 
-    def step(self):
+    def step(self, hip_target: np.ndarray | None = None, knee_target: np.ndarray | None = None):
+        if hip_target is not None and knee_target is not None:
+            self.set_targets(hip_target, knee_target)
         self._frame_impulse = pymunk.Vec2d(0.0, 0.0)
+        torque_accum = np.zeros((self.cfg.n_legs, 2), dtype=float)
         for _ in range(self.substeps):
-            self._apply_joint_torques()
+            torque_accum += self._apply_joint_torques()
             self.space.step(self.sub_dt)
+        self.last_joint_torque = torque_accum / float(self.substeps)
 
     def observe(self) -> PassiveWalkerObservation:
         cfg = self.cfg

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import partial
 import time
 import os
 from types import SimpleNamespace
@@ -56,34 +55,18 @@ def _require_runtime():
         )
 
 
-def _choose_compute_device():
-    force_gpu = os.environ.get("TRAINABLE_SYSTEM_USE_GPU", "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
+def _import_pymunk_walker():
     try:
-        cpu_device = jax.devices("cpu")[0]
-    except Exception:
-        cpu_device = jax.devices()[0]
-
-    if force_gpu:
-        try:
-            return jax.devices("gpu")[0], "gpu"
-        except Exception:
-            return cpu_device, "cpu"
-    return cpu_device, "cpu"
-
-
-def _import_walker_physics():
-    try:
-        from walking_physics import WalkerPhysics
+        from walking_physics_pymunk import (
+            PymunkPassiveWalker,
+            initial_joint_configuration,
+            make_initial_state,
+        )
     except Exception as exc:  # pragma: no cover - depends on optional runtime.
         raise ImportError(
-            "Unable to import walking_physics. Install JAX and its GPU dependencies first."
+            "Unable to import walking_physics_pymunk. Install pymunk first."
         ) from exc
-    return WalkerPhysics
+    return PymunkPassiveWalker, initial_joint_configuration, make_initial_state
 
 
 if jax is not None:
@@ -151,6 +134,9 @@ class Config:
     hip_phase_scale: float = 0.55
     knee_phase_scale: float = 0.45
     gait_prior_weight: float = 0.05
+    es_population: int = 4
+    es_noise_std: float = 0.03
+    es_reward_scale: float = 1.0
 
     # Reward shaping.
     reward_distance: float = 6.0
@@ -164,24 +150,27 @@ class Config:
     penalty_collapse: float = 8.0
     penalty_joint_limit: float = 0.5
 
-    # Differentiable walker configuration.
+    # Exact Pymunk walker configuration. These mirror run_walking_physics.py.
     n_legs: int = 2
     mass: float = 2.0
     thigh_mass: float = 0.25
     shank_mass: float = 0.18
     drag: float = 0.12
     angular_drag: float = 1.2
-    joint_drag: float = 0.12
+    joint_drag: float = 0.18
     gravity: float = 9.81
     ground_k: float = 1500.0
     ground_c: float = 35.0
     ground_tangent_damping: float = 80.0
-    friction_mu: float = 0.95
+    friction_mu: float = 0.9
     body_length: float = 0.45
     body_height: float = 0.18
     hip_x_offset: float = 0.16
     thigh_length: float = 0.22
     shank_length: float = 0.22
+    leg_radius: float = 0.022
+    foot_radius: float = 0.028
+    body_corner_radius: float = 0.012
     height_target: float = 0.48
     hip_limit: float = 0.95
     knee_min: float = 0.05
@@ -192,9 +181,18 @@ class Config:
     knee_kd: float = 8.0
     hip_torque_limit: float = 18.0
     knee_torque_limit: float = 24.0
-    init_pitch: float = 0.03
-    init_hip_delta: float = 0.10
-    init_knee_delta: float = 0.05
+    physics_substeps: int = 10
+    solver_iterations: int = 50
+    collision_slop: float = 1e-3
+    contact_epsilon: float = 2e-3
+    drop_height: float = 0.16
+    initial_pitch: float = 0.22
+    initial_omega: float = 0.0
+    initial_body_x: float = 0.0
+    initial_body_vx: float = 0.0
+    initial_body_vy: float = 0.0
+    hip_offsets: tuple[float, float] = (0.18, -0.10)
+    knee_offsets: tuple[float, float] = (-0.10, 0.06)
 
 
 @dataclass
@@ -297,10 +295,14 @@ class TrainableWalkingSystem:
         self.num_steps = int(round(cfg.episode_ms / cfg.dt_ms))
         if self.num_steps < 1:
             raise ValueError("episode_ms must produce at least one simulation step.")
-        self.compute_device, self.compute_backend = _choose_compute_device()
+        self.compute_backend = "pymunk"
+        self.rng = np.random.default_rng(cfg.random_seed)
 
-        WalkerPhysics = _import_walker_physics()
-        self.physics = WalkerPhysics(cfg)
+        (
+            self.PymunkPassiveWalker,
+            self.passive_initial_joint_configuration,
+            self.make_initial_state,
+        ) = _import_pymunk_walker()
 
         self.exc_side = max(4, int(round(np.sqrt(cfg.rho * cfg.controller_dx_mm**2))))
         self.n_exc = self.exc_side * self.exc_side
@@ -341,37 +343,42 @@ class TrainableWalkingSystem:
             num=self.n_inh,
         )
 
-        self.exc_mask = jnp.concatenate(
-            [jnp.ones((self.n_exc,), dtype=jnp.float32), jnp.zeros((self.n_inh,), dtype=jnp.float32)],
+        self.exc_mask = np.concatenate(
+            [np.ones((self.n_exc,), dtype=np.float32), np.zeros((self.n_inh,), dtype=np.float32)],
             axis=0,
         )
-        self.pre_sign = jnp.concatenate(
-            [jnp.ones((self.n_exc,), dtype=jnp.float32), -jnp.ones((self.n_inh,), dtype=jnp.float32)],
+        self.pre_sign = np.concatenate(
+            [np.ones((self.n_exc,), dtype=np.float32), -np.ones((self.n_inh,), dtype=np.float32)],
             axis=0,
         )
 
-        distance = self.all_positions[:, None, :] - self.all_positions[None, :, :]
-        dist_sq = jnp.sum(distance**2, axis=-1)
+        all_positions_np = np.asarray(self.all_positions, dtype=np.float32)
+        distance = all_positions_np[:, None, :] - all_positions_np[None, :, :]
+        dist_sq = np.sum(distance**2, axis=-1)
         sigma_sq = max(cfg.sigma_mm**2, 1e-6)
-        self.distance_kernel = jnp.exp(-0.5 * dist_sq / sigma_sq)
-        self.distance_kernel = self.distance_kernel * (1.0 - jnp.eye(self.n_total))
+        self.distance_kernel = np.exp(-0.5 * dist_sq / sigma_sq).astype(np.float32)
+        self.distance_kernel = self.distance_kernel * (
+            1.0 - np.eye(self.n_total, dtype=np.float32)
+        )
 
-        keep_prob = jnp.clip(cfg.conn_sparsity * self.distance_kernel, 0.0, 1.0)
+        keep_prob = np.clip(cfg.conn_sparsity * self.distance_kernel, 0.0, 1.0)
         self.recurrent_mask = (
-            jax.random.uniform(mask_key, shape=(self.n_total, self.n_total)) < keep_prob
-        ).astype(jnp.float32)
-        self.recurrent_mask = self.recurrent_mask * (1.0 - jnp.eye(self.n_total))
+            self.rng.uniform(size=(self.n_total, self.n_total)) < keep_prob
+        ).astype(np.float32)
+        self.recurrent_mask = self.recurrent_mask * (
+            1.0 - np.eye(self.n_total, dtype=np.float32)
+        )
 
         self.membrane_decay = float(np.exp(-cfg.dt_ms / cfg.membrane_tau_ms))
         self.synapse_decay = float(np.exp(-cfg.dt_ms / cfg.synapse_tau_ms))
         self.adapt_decay = float(np.exp(-cfg.dt_ms / cfg.adapt_tau_ms))
         self.readout_decay = float(np.exp(-cfg.dt_ms / cfg.readout_tau_ms))
 
-        nominal_hip, nominal_knee = self.physics.initial_joint_configuration()
-        self.base_hip = jnp.asarray([nominal_hip, nominal_hip], dtype=jnp.float32)
-        self.base_knee = jnp.asarray([nominal_knee, nominal_knee], dtype=jnp.float32)
+        nominal_hip, nominal_knee = self.passive_initial_joint_configuration(cfg)
+        self.base_hip = np.asarray([nominal_hip, nominal_hip], dtype=np.float32)
+        self.base_knee = np.asarray([nominal_knee, nominal_knee], dtype=np.float32)
 
-        self.obs_scale = jnp.asarray(
+        self.obs_scale = np.asarray(
             [
                 max(1.0, abs(cfg.target_vx)),
                 max(1.0, abs(cfg.target_vy)),
@@ -397,19 +404,11 @@ class TrainableWalkingSystem:
                 1.0,
                 1.0,
             ],
-            dtype=jnp.float32,
+            dtype=np.float32,
         )
 
-        self.params = self._init_params(param_key)
+        self.params = _tree_to_numpy(self._init_params(param_key))
         self.opt_state = self._adam_init(self.params)
-        self._compiled_rollout_and_metrics = jax.jit(
-            self._rollout_and_metrics,
-            device=self.compute_device,
-        )
-        self._compiled_loss_and_grad = jax.jit(
-            jax.value_and_grad(self._loss_and_metrics, has_aux=True),
-            device=self.compute_device,
-        )
 
     def _init_params(self, key):
         k1, k2, k3 = jax.random.split(key, 3)
@@ -425,7 +424,7 @@ class TrainableWalkingSystem:
         }
 
     def _adam_init(self, params) -> AdamState:
-        zeros = jax.tree_util.tree_map(jnp.zeros_like, params)
+        zeros = jax.tree_util.tree_map(lambda x: np.zeros_like(x, dtype=np.float32), params)
         return AdamState(step=0, m=zeros, v=zeros)
 
     def _adam_update(self, params, grads):
@@ -433,12 +432,12 @@ class TrainableWalkingSystem:
         state = self.opt_state
         step = state.step + 1
         m = jax.tree_util.tree_map(
-            lambda mm, gg: cfg.adam_beta1 * mm + (1.0 - cfg.adam_beta1) * gg,
+            lambda mm, gg: cfg.adam_beta1 * mm + (1.0 - cfg.adam_beta1) * gg.astype(np.float32),
             state.m,
             grads,
         )
         v = jax.tree_util.tree_map(
-            lambda vv, gg: cfg.adam_beta2 * vv + (1.0 - cfg.adam_beta2) * jnp.square(gg),
+            lambda vv, gg: cfg.adam_beta2 * vv + (1.0 - cfg.adam_beta2) * np.square(gg),
             state.v,
             grads,
         )
@@ -446,7 +445,7 @@ class TrainableWalkingSystem:
         v_hat = jax.tree_util.tree_map(lambda vv: vv / (1.0 - cfg.adam_beta2**step), v)
         params = jax.tree_util.tree_map(
             lambda pp, mm, vv: (1.0 - cfg.learning_rate * cfg.weight_decay) * pp
-            - cfg.learning_rate * mm / (jnp.sqrt(vv) + cfg.adam_eps),
+            - cfg.learning_rate * mm / (np.sqrt(vv) + cfg.adam_eps),
             params,
             m_hat,
             v_hat,
@@ -455,7 +454,7 @@ class TrainableWalkingSystem:
         return params
 
     def _controller_initial_state(self):
-        zeros = jnp.zeros((self.n_total,), dtype=jnp.float32)
+        zeros = np.zeros((self.n_total,), dtype=np.float32)
         return {
             "v": zeros,
             "syn": zeros,
@@ -464,35 +463,16 @@ class TrainableWalkingSystem:
             "filt": zeros,
         }
 
-    def _initial_walker_state(self):
-        state = self.physics.initial_state()
-        hip_offset = jnp.asarray(
-            [self.cfg.init_hip_delta, -self.cfg.init_hip_delta], dtype=jnp.float32
+    def _make_physics(self):
+        initial_state = self.make_initial_state(
+            self.cfg,
+            hip_offsets=np.asarray(self.cfg.hip_offsets, dtype=float),
+            knee_offsets=np.asarray(self.cfg.knee_offsets, dtype=float),
         )
-        knee_offset = jnp.asarray(
-            [-self.cfg.init_knee_delta, self.cfg.init_knee_delta], dtype=jnp.float32
-        )
-        return type(state)(
-            pos=jnp.asarray(state.pos, dtype=jnp.float32),
-            vel=jnp.asarray(state.vel, dtype=jnp.float32),
-            angle=jnp.asarray(self.cfg.init_pitch, dtype=jnp.float32),
-            omega=jnp.asarray(state.omega, dtype=jnp.float32),
-            hip_angle=jnp.clip(
-                jnp.asarray(state.hip_angle, dtype=jnp.float32) + hip_offset,
-                -self.cfg.hip_limit,
-                self.cfg.hip_limit,
-            ),
-            knee_angle=jnp.clip(
-                jnp.asarray(state.knee_angle, dtype=jnp.float32) + knee_offset,
-                self.cfg.knee_min,
-                self.cfg.knee_max,
-            ),
-            hip_omega=jnp.asarray(state.hip_omega, dtype=jnp.float32),
-            knee_omega=jnp.asarray(state.knee_omega, dtype=jnp.float32),
-        )
+        return self.PymunkPassiveWalker(self.cfg, initial_state)
 
     def _effective_recurrent_weights(self, params):
-        magnitude = jax.nn.softplus(params["w_rec_raw"])
+        magnitude = np.log1p(np.exp(params["w_rec_raw"]))
         sign = self.pre_sign[:, None]
         return (
             self.cfg.recurrent_gain
@@ -512,11 +492,11 @@ class TrainableWalkingSystem:
         syn = self.synapse_decay * ctrl_state["syn"] + current
         v_candidate = self.membrane_decay * ctrl_state["v"] + (1.0 - self.membrane_decay) * syn
         v_candidate = v_candidate - self.cfg.adapt_strength * ctrl_state["adapt"] * self.exc_mask
-        spike = surrogate_spike(v_candidate - self.cfg.v_th)
-        v_new = jnp.where(spike > 0.0, self.cfg.v_reset, v_candidate)
+        spike = (v_candidate > self.cfg.v_th).astype(np.float32)
+        v_new = np.where(spike > 0.0, self.cfg.v_reset, v_candidate)
         adapt = self.adapt_decay * ctrl_state["adapt"] + self.exc_mask * spike
         filt = self.readout_decay * ctrl_state["filt"] + spike
-        action = jnp.tanh(self.cfg.readout_gain * (filt @ params["w_out"] + params["bias_out"]))
+        action = np.tanh(self.cfg.readout_gain * (filt @ params["w_out"] + params["bias_out"]))
         return {
             "v": v_new,
             "syn": syn,
@@ -525,32 +505,32 @@ class TrainableWalkingSystem:
             "filt": filt,
         }, action
 
-    def _build_observation(self, state, sensed, feature_t):
-        obs = jnp.concatenate(
+    def _build_observation(self, state_like, feature_t):
+        obs = np.concatenate(
             [
                 feature_t,
-                jnp.asarray([state.pos[1]], dtype=jnp.float32),
-                jnp.asarray(state.vel, dtype=jnp.float32),
-                jnp.asarray([state.angle, state.omega], dtype=jnp.float32),
-                jnp.asarray(state.hip_angle, dtype=jnp.float32),
-                jnp.asarray(state.knee_angle, dtype=jnp.float32),
-                jnp.asarray(state.hip_omega, dtype=jnp.float32),
-                jnp.asarray(state.knee_omega, dtype=jnp.float32),
-                jnp.asarray(sensed.foot_pos[:, 1], dtype=jnp.float32),
-                jnp.asarray(sensed.foot_vel[:, 0], dtype=jnp.float32),
-                jnp.asarray(sensed.ground_contact, dtype=jnp.float32),
+                np.asarray([state_like.pos[1]], dtype=np.float32),
+                np.asarray(state_like.vel, dtype=np.float32),
+                np.asarray([state_like.angle, state_like.omega], dtype=np.float32),
+                np.asarray(state_like.hip_angle, dtype=np.float32),
+                np.asarray(state_like.knee_angle, dtype=np.float32),
+                np.asarray(state_like.hip_omega, dtype=np.float32),
+                np.asarray(state_like.knee_omega, dtype=np.float32),
+                np.asarray(state_like.foot_pos[:, 1], dtype=np.float32),
+                np.asarray(state_like.foot_vel[:, 0], dtype=np.float32),
+                np.asarray(state_like.ground_contact, dtype=np.float32),
             ],
             axis=0,
         )
         return obs / self.obs_scale
 
     def _decode_targets(self, action):
-        hip = jnp.clip(
+        hip = np.clip(
             self.base_hip + self.cfg.hip_action_scale * action[: self.cfg.n_legs],
             -self.cfg.hip_limit,
             self.cfg.hip_limit,
         )
-        knee = jnp.clip(
+        knee = np.clip(
             self.base_knee + self.cfg.knee_action_scale * action[self.cfg.n_legs :],
             self.cfg.knee_min,
             self.cfg.knee_max,
@@ -566,7 +546,7 @@ class TrainableWalkingSystem:
                 self.cfg.target_vy,
                 self.cfg.base_freq_hz,
             )
-        features = jnp.asarray(features, dtype=jnp.float32)
+        features = np.asarray(features, dtype=np.float32)
         if features.shape != (self.num_steps, 4):
             raise ValueError(
                 f"Expected features with shape {(self.num_steps, 4)}, got {features.shape}."
@@ -574,12 +554,8 @@ class TrainableWalkingSystem:
         return features
 
     def _simulate(self, params, features, progress_label: Optional[str] = None):
-        if progress_label is None:
-            return self._simulate_scan(params, features)
-        return self._simulate_python(params, features, progress_label)
-
-    def _simulate_python(self, params, features, progress_label: Optional[str] = None):
-        state = self._initial_walker_state()
+        physics = self._make_physics()
+        sensed = physics.observe()
         ctrl_state = self._controller_initial_state()
         progress = None
         progress_stride = None
@@ -603,113 +579,51 @@ class TrainableWalkingSystem:
         filt_hist = []
 
         for t in range(self.num_steps):
-            sensed = self.physics.sense(state)
-            obs = self._build_observation(state, sensed, features[t])
+            obs = self._build_observation(sensed, features[t])
             ctrl_state, action = self._controller_step(params, ctrl_state, obs)
             hip_target, knee_target = self._decode_targets(action)
-            step = self.physics.step(state, hip_target, knee_target)
-            state = step.state
+            physics.step(hip_target=hip_target, knee_target=knee_target)
+            sensed = physics.observe()
 
-            pos.append(jnp.asarray(state.pos, dtype=jnp.float32))
-            vel.append(jnp.asarray(state.vel, dtype=jnp.float32))
-            angle.append(jnp.asarray(state.angle, dtype=jnp.float32))
-            omega.append(jnp.asarray(state.omega, dtype=jnp.float32))
-            hip_angle.append(jnp.asarray(state.hip_angle, dtype=jnp.float32))
-            knee_angle.append(jnp.asarray(state.knee_angle, dtype=jnp.float32))
-            foot_pos.append(jnp.asarray(step.foot_pos, dtype=jnp.float32))
-            foot_vel.append(jnp.asarray(step.foot_vel, dtype=jnp.float32))
-            ground_contact.append(jnp.asarray(step.ground_contact, dtype=jnp.float32))
-            force.append(jnp.asarray(step.total_ground_force, dtype=jnp.float32))
-            joint_torque.append(jnp.asarray(step.joint_torque, dtype=jnp.float32))
+            pos.append(np.asarray(sensed.pos, dtype=np.float32))
+            vel.append(np.asarray(sensed.vel, dtype=np.float32))
+            angle.append(np.asarray(sensed.angle, dtype=np.float32))
+            omega.append(np.asarray(sensed.omega, dtype=np.float32))
+            hip_angle.append(np.asarray(sensed.hip_angle, dtype=np.float32))
+            knee_angle.append(np.asarray(sensed.knee_angle, dtype=np.float32))
+            foot_pos.append(np.asarray(sensed.foot_pos, dtype=np.float32))
+            foot_vel.append(np.asarray(sensed.foot_vel, dtype=np.float32))
+            ground_contact.append(np.asarray(sensed.ground_contact, dtype=np.float32))
+            force.append(np.asarray(sensed.total_ground_force, dtype=np.float32))
+            joint_torque.append(np.asarray(physics.last_joint_torque, dtype=np.float32))
             action_hist.append(action)
             spike_hist.append(ctrl_state["spike"])
             filt_hist.append(ctrl_state["filt"])
             if progress is not None and ((t + 1) % progress_stride == 0 or (t + 1) == self.num_steps):
                 progress.update(t + 1)
 
-        spikes = jnp.stack(spike_hist, axis=0)
+        spikes = np.stack(spike_hist, axis=0).astype(np.float32)
         if progress is not None:
             progress.finish()
         return {
-            "ts": jnp.arange(self.num_steps, dtype=jnp.float32) * self.cfg.dt_ms,
-            "pos": jnp.stack(pos, axis=0),
-            "vel": jnp.stack(vel, axis=0),
-            "angle": jnp.stack(angle, axis=0),
-            "omega": jnp.stack(omega, axis=0),
-            "hip_angle": jnp.stack(hip_angle, axis=0),
-            "knee_angle": jnp.stack(knee_angle, axis=0),
-            "foot_pos": jnp.stack(foot_pos, axis=0),
-            "foot_vel": jnp.stack(foot_vel, axis=0),
-            "ground_contact": jnp.stack(ground_contact, axis=0),
-            "force": jnp.stack(force, axis=0),
-            "joint_torque": jnp.stack(joint_torque, axis=0),
-            "action": jnp.stack(action_hist, axis=0),
+            "ts": np.arange(self.num_steps, dtype=np.float32) * self.cfg.dt_ms,
+            "pos": np.stack(pos, axis=0).astype(np.float32),
+            "vel": np.stack(vel, axis=0).astype(np.float32),
+            "angle": np.stack(angle, axis=0).astype(np.float32),
+            "omega": np.stack(omega, axis=0).astype(np.float32),
+            "hip_angle": np.stack(hip_angle, axis=0).astype(np.float32),
+            "knee_angle": np.stack(knee_angle, axis=0).astype(np.float32),
+            "foot_pos": np.stack(foot_pos, axis=0).astype(np.float32),
+            "foot_vel": np.stack(foot_vel, axis=0).astype(np.float32),
+            "ground_contact": np.stack(ground_contact, axis=0).astype(np.float32),
+            "force": np.stack(force, axis=0).astype(np.float32),
+            "joint_torque": np.stack(joint_torque, axis=0).astype(np.float32),
+            "action": np.stack(action_hist, axis=0).astype(np.float32),
             "spike": spikes,
-            "filtered_spike": jnp.stack(filt_hist, axis=0),
+            "filtered_spike": np.stack(filt_hist, axis=0).astype(np.float32),
             "E.spike": spikes[:, : self.n_exc],
             "I.spike": spikes[:, self.n_exc :],
         }
-
-    def _simulate_scan(self, params, features):
-        state0 = self._initial_walker_state()
-        ctrl_state0 = self._controller_initial_state()
-
-        def scan_step(carry, feature_t):
-            state, ctrl_state = carry
-            sensed = self.physics.sense(state)
-            obs = self._build_observation(state, sensed, feature_t)
-            ctrl_state, action = self._controller_step(params, ctrl_state, obs)
-            hip_target, knee_target = self._decode_targets(action)
-            step = self.physics.step(state, hip_target, knee_target)
-            next_state = step.state
-            outputs = {
-                "pos": jnp.asarray(next_state.pos, dtype=jnp.float32),
-                "vel": jnp.asarray(next_state.vel, dtype=jnp.float32),
-                "angle": jnp.asarray(next_state.angle, dtype=jnp.float32),
-                "omega": jnp.asarray(next_state.omega, dtype=jnp.float32),
-                "hip_angle": jnp.asarray(next_state.hip_angle, dtype=jnp.float32),
-                "knee_angle": jnp.asarray(next_state.knee_angle, dtype=jnp.float32),
-                "foot_pos": jnp.asarray(step.foot_pos, dtype=jnp.float32),
-                "foot_vel": jnp.asarray(step.foot_vel, dtype=jnp.float32),
-                "ground_contact": jnp.asarray(step.ground_contact, dtype=jnp.float32),
-                "force": jnp.asarray(step.total_ground_force, dtype=jnp.float32),
-                "joint_torque": jnp.asarray(step.joint_torque, dtype=jnp.float32),
-                "action": jnp.asarray(action, dtype=jnp.float32),
-                "spike": jnp.asarray(ctrl_state["spike"], dtype=jnp.float32),
-                "filtered_spike": jnp.asarray(ctrl_state["filt"], dtype=jnp.float32),
-            }
-            return (next_state, ctrl_state), outputs
-
-        (_, _), traj = jax.lax.scan(scan_step, (state0, ctrl_state0), features)
-        spikes = traj["spike"]
-        return {
-            "ts": jnp.arange(self.num_steps, dtype=jnp.float32) * self.cfg.dt_ms,
-            "pos": traj["pos"],
-            "vel": traj["vel"],
-            "angle": traj["angle"],
-            "omega": traj["omega"],
-            "hip_angle": traj["hip_angle"],
-            "knee_angle": traj["knee_angle"],
-            "foot_pos": traj["foot_pos"],
-            "foot_vel": traj["foot_vel"],
-            "ground_contact": traj["ground_contact"],
-            "force": traj["force"],
-            "joint_torque": traj["joint_torque"],
-            "action": traj["action"],
-            "spike": spikes,
-            "filtered_spike": traj["filtered_spike"],
-            "E.spike": spikes[:, : self.n_exc],
-            "I.spike": spikes[:, self.n_exc :],
-        }
-
-    def _loss_and_metrics(self, params, features):
-        rollout = self._simulate_scan(params, features)
-        return self._metrics_from_rollout(rollout, features)
-
-    def _rollout_and_metrics(self, params, features):
-        rollout = self._simulate_scan(params, features)
-        _, metrics = self._metrics_from_rollout(rollout, features)
-        return rollout, metrics
 
     def _metrics_from_rollout(self, rollout, features):
         cfg = self.cfg
@@ -724,34 +638,34 @@ class TrainableWalkingSystem:
         knee_angle = rollout["knee_angle"]
 
         distance = pos[-1, 0] - pos[0, 0]
-        mean_vx = jnp.mean(vel[:, 0])
-        speed_tracking = jnp.mean(jnp.square(vel[:, 0] - cfg.target_vx))
-        speed_tracking = speed_tracking + 0.25 * jnp.mean(jnp.square(vel[:, 1] - cfg.target_vy))
-        height_error = jnp.mean(jnp.square(pos[:, 1] - cfg.height_target))
-        pitch_error = jnp.mean(jnp.square(angle))
-        energy = jnp.mean(jnp.sum(jnp.square(joint_torque), axis=(1, 2)))
+        mean_vx = float(np.mean(vel[:, 0]))
+        speed_tracking = float(np.mean(np.square(vel[:, 0] - cfg.target_vx)))
+        speed_tracking = speed_tracking + 0.25 * float(np.mean(np.square(vel[:, 1] - cfg.target_vy)))
+        height_error = float(np.mean(np.square(pos[:, 1] - cfg.height_target)))
+        pitch_error = float(np.mean(np.square(angle)))
+        energy = float(np.mean(np.sum(np.square(joint_torque), axis=(1, 2))))
         if action.shape[0] > 1:
-            action_rate = jnp.mean(jnp.sum(jnp.square(action[1:] - action[:-1]), axis=1))
+            action_rate = float(np.mean(np.sum(np.square(action[1:] - action[:-1]), axis=1)))
         else:
-            action_rate = jnp.asarray(0.0, dtype=jnp.float32)
-        slip = jnp.mean(jnp.sum(contact * jnp.square(foot_vel[:, :, 0]), axis=1))
-        collapse = jnp.mean(jax.nn.relu(0.30 - pos[:, 1]) ** 2)
-        hip_limit_penalty = jnp.mean(
-            jnp.square(jax.nn.relu(jnp.abs(hip_angle) - 0.95 * cfg.hip_limit))
-        )
-        knee_limit_penalty = jnp.mean(
-            jnp.square(jax.nn.relu(cfg.knee_min + 0.02 - knee_angle))
-            + jnp.square(jax.nn.relu(knee_angle - (cfg.knee_max - 0.02)))
-        )
+            action_rate = 0.0
+        slip = float(np.mean(np.sum(contact * np.square(foot_vel[:, :, 0]), axis=1)))
+        collapse = float(np.mean(np.square(np.maximum(0.30 - pos[:, 1], 0.0))))
+        hip_limit_penalty = float(np.mean(
+            np.square(np.maximum(np.abs(hip_angle) - 0.95 * cfg.hip_limit, 0.0))
+        ))
+        knee_limit_penalty = float(np.mean(
+            np.square(np.maximum(cfg.knee_min + 0.02 - knee_angle, 0.0))
+            + np.square(np.maximum(knee_angle - (cfg.knee_max - 0.02), 0.0))
+        ))
         joint_limit_penalty = hip_limit_penalty + knee_limit_penalty
 
         phase = features[:, 2:3]
-        desired_hip = cfg.hip_phase_scale * phase * jnp.asarray([[1.0, -1.0]], dtype=jnp.float32)
-        desired_knee = cfg.knee_phase_scale * jnp.maximum(
-            -phase * jnp.asarray([[1.0, -1.0]], dtype=jnp.float32), 0.0
+        desired_hip = cfg.hip_phase_scale * phase * np.asarray([[1.0, -1.0]], dtype=np.float32)
+        desired_knee = cfg.knee_phase_scale * np.maximum(
+            -phase * np.asarray([[1.0, -1.0]], dtype=np.float32), 0.0
         )
-        desired_action = jnp.concatenate([desired_hip, desired_knee], axis=1)
-        gait_prior = jnp.mean(jnp.square(action - desired_action))
+        desired_action = np.concatenate([desired_hip, desired_knee], axis=1)
+        gait_prior = float(np.mean(np.square(action - desired_action)))
 
         reward = cfg.reward_distance * distance + cfg.reward_speed * mean_vx
         reward = reward - cfg.penalty_speed_tracking * speed_tracking
@@ -766,52 +680,62 @@ class TrainableWalkingSystem:
 
         loss = -reward
         metrics = {
-            "loss": loss,
-            "reward": reward,
-            "distance": distance,
-            "mean_vx": mean_vx,
-            "height_error": height_error,
-            "pitch_error": pitch_error,
-            "speed_tracking": speed_tracking,
+            "loss": float(loss),
+            "reward": float(reward),
+            "distance": float(distance),
+            "mean_vx": float(mean_vx),
+            "height_error": float(height_error),
+            "pitch_error": float(pitch_error),
+            "speed_tracking": float(speed_tracking),
         }
         return loss, metrics
 
     def train_step(self, features: Optional[np.ndarray] = None) -> Dict[str, float]:
-        features = jax.device_put(self._coerce_features(features), self.compute_device)
-        self.params = jax.device_put(self.params, self.compute_device)
-        (loss, metrics), grads = self._compiled_loss_and_grad(self.params, features)
-        loss = jax.block_until_ready(loss)
-        grad_norm = _tree_global_norm(grads)
-        scale = jnp.minimum(1.0, self.cfg.gradient_clip / (grad_norm + 1e-8))
-        grads = jax.tree_util.tree_map(lambda gg: gg * scale, grads)
-        self.params = self._adam_update(self.params, grads)
+        features = self._coerce_features(features)
+        sigma = float(self.cfg.es_noise_std)
+        population = max(1, int(self.cfg.es_population))
+        grad_accum = jax.tree_util.tree_map(lambda p: np.zeros_like(p, dtype=np.float32), self.params)
 
-        python_metrics = _python_metrics(metrics)
-        python_metrics["loss"] = float(np.asarray(loss))
-        python_metrics["grad_norm"] = float(np.asarray(grad_norm))
-        return python_metrics
+        for _ in range(population):
+            noise = jax.tree_util.tree_map(
+                lambda p: self.rng.standard_normal(p.shape).astype(np.float32),
+                self.params,
+            )
+            params_plus = jax.tree_util.tree_map(lambda p, n: p + sigma * n, self.params, noise)
+            params_minus = jax.tree_util.tree_map(lambda p, n: p - sigma * n, self.params, noise)
+            reward_plus = self._metrics_from_rollout(self._simulate(params_plus, features), features)[1]["reward"]
+            reward_minus = self._metrics_from_rollout(self._simulate(params_minus, features), features)[1]["reward"]
+            coeff = self.cfg.es_reward_scale * (reward_plus - reward_minus) / (2.0 * sigma * population)
+            grad_accum = jax.tree_util.tree_map(
+                lambda g, n: g + coeff * n,
+                grad_accum,
+                noise,
+            )
+
+        grad_norm = float(_tree_global_norm(grad_accum))
+        if grad_norm > self.cfg.gradient_clip > 0.0:
+            scale = self.cfg.gradient_clip / (grad_norm + 1e-8)
+            grad_accum = jax.tree_util.tree_map(lambda g: g * scale, grad_accum)
+
+        self.params = self._adam_update(self.params, grad_accum)
+        rollout = self._simulate(self.params, features)
+        loss, metrics = self._metrics_from_rollout(rollout, features)
+        metrics["loss"] = float(loss)
+        metrics["grad_norm"] = grad_norm
+        return metrics
 
     def evaluate(self, features: Optional[np.ndarray] = None):
-        features = jax.device_put(self._coerce_features(features), self.compute_device)
-        self.params = jax.device_put(self.params, self.compute_device)
-        rollout, metrics = self._compiled_rollout_and_metrics(self.params, features)
-        rollout["pos"].block_until_ready()
-        return _tree_to_numpy(rollout), _python_metrics(metrics)
+        features = self._coerce_features(features)
+        rollout = self._simulate(self.params, features)
+        _, metrics = self._metrics_from_rollout(rollout, features)
+        return rollout, metrics
 
     def evaluate_with_progress(
         self, features: Optional[np.ndarray] = None, progress_label: str = "rollout"
     ):
-        features = jax.device_put(self._coerce_features(features), self.compute_device)
-        self.params = jax.device_put(self.params, self.compute_device)
-        progress = TerminalProgressBar(3, progress_label)
-        progress.update(1)
-        rollout, metrics = self._compiled_rollout_and_metrics(self.params, features)
-        rollout["pos"].block_until_ready()
-        progress.update(2)
-        rollout = _tree_to_numpy(rollout)
-        metrics = _python_metrics(metrics)
-        progress.update(3)
-        progress.finish()
+        features = self._coerce_features(features)
+        rollout = self._simulate(self.params, features, progress_label=progress_label)
+        _, metrics = self._metrics_from_rollout(rollout, features)
         return rollout, metrics
 
 
