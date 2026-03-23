@@ -1030,6 +1030,7 @@ class TrainingViewer:
 
         self.latest_rollout = None
         self.latest_metrics = None
+        self.pending_snapshot = None
         self.frame_indices = np.asarray([0], dtype=int)
         self.frame_times = np.asarray([0.0], dtype=float)
         self.frame_ptr = 0
@@ -1131,19 +1132,8 @@ class TrainingViewer:
         self.ax_status.set_xlim(0.0, 1.0)
         self.ax_status.set_ylim(0.0, 1.0)
         self.ax_status.axis("off")
-        self.ax_status.text(0.0, 0.82, "Train", va="center", ha="left", fontsize=9)
-        self.ax_status.text(0.0, 0.63, "Play", va="center", ha="left", fontsize=9)
-        self.ax_status.text(0.0, 0.43, "Phase", va="center", ha="left", fontsize=9)
-        self.train_bar_bg = plt.Rectangle((0.18, 0.77), 0.74, 0.08, color="0.9")
-        self.train_bar_fg = plt.Rectangle((0.18, 0.77), 0.0, 0.08, color="tab:blue")
-        self.play_bar_bg = plt.Rectangle((0.18, 0.58), 0.74, 0.08, color="0.9")
-        self.play_bar_fg = plt.Rectangle((0.18, 0.58), 0.0, 0.08, color="tab:orange")
-        self.ax_status.add_patch(self.train_bar_bg)
-        self.ax_status.add_patch(self.train_bar_fg)
-        self.ax_status.add_patch(self.play_bar_bg)
-        self.ax_status.add_patch(self.play_bar_fg)
         self.phase_text = self.ax_status.text(
-            0.18, 0.43, "", va="center", ha="left", family="monospace", fontsize=9
+            0.0, 0.88, "", va="top", ha="left", family="monospace", fontsize=9
         )
 
     def _set_phase(self, phase: str, detail: str):
@@ -1191,13 +1181,13 @@ class TrainingViewer:
 
             if msg_type == "snapshot":
                 self._record_metrics(int(message["epoch"]), message["metrics"])
-                self._set_rollout(
-                    message["rollout"],
-                    message["metrics"],
-                    frame_indices=message.get("frame_indices"),
-                    frame_times=message.get("frame_times"),
-                    histograms=message.get("histograms"),
-                )
+                self.pending_snapshot = {
+                    "rollout": message["rollout"],
+                    "metrics": message["metrics"],
+                    "frame_indices": message.get("frame_indices"),
+                    "frame_times": message.get("frame_times"),
+                    "histograms": message.get("histograms"),
+                }
                 continue
 
             if msg_type == "done":
@@ -1215,6 +1205,20 @@ class TrainingViewer:
                     flush=True,
                 )
         return received
+
+    def _apply_pending_snapshot(self) -> bool:
+        if self.pending_snapshot is None:
+            return False
+        snapshot = self.pending_snapshot
+        self.pending_snapshot = None
+        self._set_rollout(
+            snapshot["rollout"],
+            snapshot["metrics"],
+            frame_indices=snapshot.get("frame_indices"),
+            frame_times=snapshot.get("frame_times"),
+            histograms=snapshot.get("histograms"),
+        )
+        return True
 
     def _rotation_matrix(self, theta: float) -> np.ndarray:
         c = np.cos(theta)
@@ -1352,12 +1356,6 @@ class TrainingViewer:
 
     def _refresh_status(self):
         elapsed = time.perf_counter() - self.start_time
-        train_progress = 0.15 + 0.85 * (0.5 + 0.5 * np.sin(0.2 * self.train_tick_count))
-        play_progress = 0.0 if len(self.frame_indices) <= 1 else self.frame_ptr / float(
-            len(self.frame_indices) - 1
-        )
-        self.train_bar_fg.set_width(0.74 * train_progress)
-        self.play_bar_fg.set_width(0.74 * play_progress)
         self.phase_text.set_text(f"{self.current_phase:<10} {self.phase_detail}")
         if self.latest_metrics is None:
             summary = [
@@ -1399,10 +1397,13 @@ class TrainingViewer:
     def _on_anim_tick(self):
         if self.closed or self.latest_rollout is None:
             return
+        if self.frame_ptr >= len(self.frame_indices) - 1:
+            if self._apply_pending_snapshot():
+                self._refresh_status()
+                self.fig.canvas.draw_idle()
+            return
         next_ptr = min(self.frame_ptr + 1, len(self.frame_indices) - 1)
         self._draw_frame(next_ptr)
-        if self.current_phase == "idle":
-            self._refresh_status()
         self.fig.canvas.draw_idle()
 
     def _on_train_tick(self):
@@ -1410,10 +1411,14 @@ class TrainingViewer:
             return
         self.train_tick_count += 1
         changed = self._drain_backend_messages()
+        redraw = False
+        if self.latest_rollout is None and self.pending_snapshot is not None:
+            redraw = self._apply_pending_snapshot()
         if not self.worker_process.is_alive() and not self.worker_done:
             self.worker_done = True
             if self.current_phase not in {"done", "error"}:
                 self._set_phase("done", "backend exited")
+                changed = True
 
         if self.worker_done and self.current_phase != "error":
             self.train_timer.stop()
@@ -1430,9 +1435,12 @@ class TrainingViewer:
                     flush=True,
                 )
                 self.last_log_time = now
-        self._refresh_metric_plot()
-        self._refresh_status()
-        self.fig.canvas.draw_idle()
+        if changed:
+            self._refresh_metric_plot()
+            self._refresh_status()
+            redraw = True
+        if redraw:
+            self.fig.canvas.draw_idle()
 
     def show(self):
         self.anim_timer.start()
