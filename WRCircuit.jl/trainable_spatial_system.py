@@ -52,6 +52,26 @@ def _require_runtime():
         )
 
 
+def _compatible_spatial_connectivity(cfg: Config) -> dict[str, int]:
+    ne = max(1, int(round(np.sqrt(cfg.rho * cfg.controller_dx_mm**2))))
+    ne_total = ne * ne
+    ni = max(1, int(round(ne_total / cfg.gamma)))
+
+    requested = {
+        "K_ee": 260,
+        "K_ei": 340,
+        "K_ie": 225,
+        "K_ii": 290,
+    }
+    limits = {
+        "K_ee": max(1, (ne_total * ne_total) // ne),
+        "K_ei": max(1, ne_total),
+        "K_ie": max(1, (ni * ne_total) // ne),
+        "K_ii": max(1, ni),
+    }
+    return {name: int(min(requested[name], limits[name])) for name in requested}
+
+
 class TrainableSpatialWalkingSystem(_BaseTrainableWalkingSystem):
     def _init_params(self, key):
         k1, k2 = jax.random.split(key, 2)
@@ -72,11 +92,13 @@ class TrainableSpatialWalkingSystem(_BaseTrainableWalkingSystem):
         bm.set_dt(cfg.dt_ms)
 
         spatial_key = jax.random.PRNGKey(cfg.random_seed)
+        self.spatial_connectivity = _compatible_spatial_connectivity(cfg)
         self.spatial_model = Spatial(
             key=spatial_key,
             rho=cfg.rho,
             dx=cfg.controller_dx_mm,
             gamma=cfg.gamma,
+            **self.spatial_connectivity,
         )
 
         self.exc_side = int(np.asarray(self.spatial_model.E.size, dtype=int)[0])
