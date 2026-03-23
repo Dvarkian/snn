@@ -1226,6 +1226,7 @@ class LiveDashboard:
         self.last_rollout_version = -1
         self.last_title = ""
         self.clip_started_at = time.perf_counter()
+        self.playback_origin_at: Optional[float] = None
 
         plt.ion()
 
@@ -1416,6 +1417,8 @@ class LiveDashboard:
         )
         self.current_rollout_idx = idx
         self.current_rollout = rollout
+        if self.playback_origin_at is None:
+            self.playback_origin_at = time.perf_counter()
 
         if rollout_changed:
             self._apply_rollout(rollout)
@@ -1460,6 +1463,11 @@ class LiveDashboard:
         elapsed_ms = (time.perf_counter() - self.clip_started_at) * 1000.0
         span_ms = max(0.0, float(rollout.ts_ms[-1] - rollout.ts_ms[0]))
         return float(rollout.ts_ms[0]) + min(elapsed_ms, span_ms)
+
+    def _playback_elapsed_ms(self) -> float:
+        if self.playback_origin_at is None:
+            return 0.0
+        return (time.perf_counter() - self.playback_origin_at) * 1000.0
 
     def _apply_history(self, view):
         history = view["history"]
@@ -1576,10 +1584,10 @@ class LiveDashboard:
             [y, y + force[1] * force_scale],
         )
 
-        t_rel = current_time_ms - float(rollout.ts_ms[0])
+        display_t_ms = self._playback_elapsed_ms()
         clip_label = f"snapshot {self.current_rollout_idx + 1}/{len(self.rollout_sequence)}"
         self.ax_robot.set_title(
-            f"Rigid Walker | {clip_label} | epoch {rollout.epoch} | t={t_rel:.0f} ms | "
+            f"Rigid Walker | {clip_label} | epoch {rollout.epoch} | t={display_t_ms:.0f} ms | "
             f"x={x:.3f} y={y:.3f} pitch={theta:.3f}"
         )
 
@@ -1595,10 +1603,10 @@ class LiveDashboard:
 
         self._update_robot(rollout, state_idx, current_time_ms)
         self.im.set_data(rollout.heatmaps[heatmap_idx].T)
-        t_rel = current_time_ms - float(rollout.ts_ms[0])
+        display_t_ms = self._playback_elapsed_ms()
         self.ax_heatmap.set_title(
             f"Spatial Firing | snapshot {self.current_rollout_idx + 1}/{len(self.rollout_sequence)} | "
-            f"epoch {rollout.epoch} | t={t_rel:.0f} ms"
+            f"epoch {rollout.epoch} | t={display_t_ms:.0f} ms"
         )
 
         cursor_x = float(rollout.ts_ms[state_idx])
@@ -1764,6 +1772,7 @@ def prepare_spike_histograms(
             i == len(frame_times) - 1 or (i + 1) % progress_stride == 0
         ):
             progress((i + 1) / max(1, len(frame_times)))
+            time.sleep(0)
     return histograms, frame_times
 
 
@@ -2035,6 +2044,7 @@ def _collect_rollout_python(
             i == num_steps - 1 or (i + 1) % progress_stride == 0
         ):
             progress((i + 1) / max(1, num_steps))
+            time.sleep(0)
 
     stacked = {key: np.asarray(value) for key, value in mon.items()}
     return SimpleNamespace(mon=stacked)
@@ -2165,10 +2175,11 @@ def run_live_training_dashboard(cfg: Config):
     dashboard = LiveDashboard(cfg, state)
     worker = TrainingWorker(cfg, state)
     worker.start()
+    refresh_hz = max(60.0, float(cfg.animation_fps))
 
     try:
         while dashboard.refresh():
-            plt.pause(1.0 / max(1.0, cfg.animation_fps))
+            plt.pause(1.0 / refresh_hz)
     finally:
         state.stop_requested.set()
         worker.join(timeout=1.0)
