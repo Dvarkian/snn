@@ -725,6 +725,8 @@ class TrainingViewer:
         self.train_tick_count = 0
         self.start_time = time.perf_counter()
         self.last_log_time = self.start_time
+        self.bootstrap_pending = True
+        self._bootstrap_started = False
 
         self.fig = plt.figure(figsize=(14, 8))
         gs = self.fig.add_gridspec(2, 2, width_ratios=[1.15, 1.0], hspace=0.30, wspace=0.28)
@@ -751,10 +753,7 @@ class TrainingViewer:
 
         self.fig.canvas.mpl_connect("close_event", self._on_close)
 
-        self._set_phase("evaluating", "running initial rollout")
-        rollout, metrics = self.system.evaluate(self.features)
-        self._set_rollout(rollout, metrics)
-        self._set_phase("idle", "ready to train")
+        self._set_phase("starting", "viewer ready, waiting for first rollout")
         self._refresh_status()
 
         self.anim_timer = self.fig.canvas.new_timer(
@@ -967,8 +966,6 @@ class TrainingViewer:
         )
 
     def _refresh_status(self):
-        if self.latest_metrics is None:
-            return
         elapsed = time.perf_counter() - self.start_time
         train_progress = 0.0 if self.cfg.train_epochs <= 0 else min(
             1.0, self.epoch / float(self.cfg.train_epochs)
@@ -979,16 +976,30 @@ class TrainingViewer:
         self.train_bar_fg.set_width(0.74 * train_progress)
         self.play_bar_fg.set_width(0.74 * play_progress)
         self.phase_text.set_text(f"{self.current_phase:<10} {self.phase_detail}")
+        metric_lines = (
+            [
+                f"loss           : {self.history_loss[-1]: .4f}" if self.history_loss else "loss           : n/a",
+                f"distance       : {self.latest_metrics['distance']: .4f}",
+                f"mean vx        : {self.latest_metrics['mean_vx']: .4f}",
+                f"reward         : {self.latest_metrics['reward']: .4f}",
+                f"height error   : {self.latest_metrics['height_error']: .4f}",
+                f"pitch error    : {self.latest_metrics['pitch_error']: .4f}",
+            ]
+            if self.latest_metrics is not None
+            else [
+                "loss           : compiling / waiting",
+                "distance       : n/a",
+                "mean vx        : n/a",
+                "reward         : n/a",
+                "height error   : n/a",
+                "pitch error    : n/a",
+            ]
+        )
         self.status_text.set_text(
             "\n".join(
                 [
                     f"epoch          : {self.epoch:4d} / {self.cfg.train_epochs}",
-                    f"loss           : {self.history_loss[-1]: .4f}" if self.history_loss else "loss           : n/a",
-                    f"distance       : {self.latest_metrics['distance']: .4f}",
-                    f"mean vx        : {self.latest_metrics['mean_vx']: .4f}",
-                    f"reward         : {self.latest_metrics['reward']: .4f}",
-                    f"height error   : {self.latest_metrics['height_error']: .4f}",
-                    f"pitch error    : {self.latest_metrics['pitch_error']: .4f}",
+                    *metric_lines,
                     f"train progress : {100.0 * train_progress:6.2f} %",
                     f"playback       : {100.0 * play_progress:6.2f} %",
                     f"tick count     : {self.train_tick_count:6d}",
@@ -1029,6 +1040,32 @@ class TrainingViewer:
 
     def _on_train_tick(self):
         if self.closed:
+            return
+        if self.bootstrap_pending:
+            self.train_tick_count += 1
+            self._set_phase("evaluating", "running initial rollout / JAX compile")
+            self._refresh_status()
+            self.fig.canvas.draw_idle()
+            if not self._bootstrap_started:
+                print(
+                    "[trainable_system] starting initial rollout and JAX compile...",
+                    flush=True,
+                )
+                self._bootstrap_started = True
+            bootstrap_start = time.perf_counter()
+            rollout, metrics = self.system.evaluate(self.features)
+            self.last_phase_seconds = time.perf_counter() - bootstrap_start
+            self._set_rollout(rollout, metrics)
+            self.bootstrap_pending = False
+            self._set_phase("idle", "ready to train")
+            print(
+                "[trainable_system] initial rollout ready "
+                f"(compile_s={self.last_phase_seconds:.2f})",
+                flush=True,
+            )
+            self._refresh_metric_plot()
+            self._refresh_status()
+            self.fig.canvas.draw_idle()
             return
         if self.epoch >= self.cfg.train_epochs:
             self.train_timer.stop()
