@@ -1,800 +1,250 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import multiprocessing as mp
-import queue
-import time
-import os
-from types import SimpleNamespace
-from typing import Any, Dict, Optional
+from typing import Optional
 
 import numpy as np
 
-
-def _ensure_writable_runtime_dirs():
-    runtime_home = os.path.expanduser("~")
-    try:
-        probe_path = os.path.join(runtime_home, ".wrcircuit_write_probe")
-        with open(probe_path, "w", encoding="utf-8") as handle:
-            handle.write("")
-        os.remove(probe_path)
-    except OSError:
-        runtime_home = os.path.join("/tmp", "wrcircuit-home")
-        os.makedirs(runtime_home, exist_ok=True)
-        os.environ["HOME"] = runtime_home
-
-    if "MPLCONFIGDIR" not in os.environ:
-        mpl_config_dir = os.path.join(runtime_home, ".config", "matplotlib")
-        os.makedirs(mpl_config_dir, exist_ok=True)
-        os.environ["MPLCONFIGDIR"] = mpl_config_dir
+from trainable_system import (
+    AdamState,
+    Config,
+    RolloutRunner,
+    TerminalProgressBar,
+    TrainingViewer,
+    TrainableWalkingSystem as _BaseTrainableWalkingSystem,
+    _ensure_writable_runtime_dirs,
+    _log,
+    _metrics_summary,
+    _queue_put_latest,
+    _require_runtime as _require_base_runtime,
+    _tree_global_norm,
+    _tree_to_numpy,
+    build_feature_sequence,
+    jax,
+    jnp,
+)
 
 
 _ensure_writable_runtime_dirs()
 
-import matplotlib.pyplot as plt
-from matplotlib.collections import LineCollection
 
-from models.Spatial import Spatial
-import brainpy as bp
-from src.synapses import ExponentialKernel
-
-
-_JAX_IMPORT_ERROR = None
+_SPATIAL_IMPORT_ERROR = None
 
 try:
-    import jax
-    import jax.numpy as jnp
+    import brainpy as bp
+    import brainpy.math as bm
+
+    from src.models.Spatial import Spatial
 except Exception as exc:  # pragma: no cover - exercised only when runtime is missing.
-    jax = None
-    jnp = None
-    _JAX_IMPORT_ERROR = exc
+    bp = None
+    bm = None
+    Spatial = None
+    _SPATIAL_IMPORT_ERROR = exc
 
 
 def _require_runtime():
-    missing = []
-    if jax is None:
-        missing.append(f"jax ({_JAX_IMPORT_ERROR})")
-    if missing:
+    _require_base_runtime()
+    if bp is None or bm is None or Spatial is None:
         raise ImportError(
-            "trainable_spatial_system.py requires pip-installable Python packages. "
-            "Install at least: numpy matplotlib jax jaxlib. "
-            f"Missing runtime pieces: {', '.join(missing)}"
+            "trainable_spatial_system.py requires the spatial BrainPy runtime. "
+            "Install at least: brainpy, jax, jaxlib, numpy, matplotlib. "
+            f"Missing runtime pieces: brainpy/spatial ({_SPATIAL_IMPORT_ERROR})"
         )
 
 
-def _import_pymunk_walker():
-    try:
-        from walking_physics_pymunk import (
-            PymunkPassiveWalker,
-            initial_joint_configuration,
-            make_initial_state,
-        )
-    except Exception as exc:  # pragma: no cover - depends on optional runtime.
-        raise ImportError(
-            "Unable to import walking_physics_pymunk. Install pymunk first."
-        ) from exc
-    return PymunkPassiveWalker, initial_joint_configuration, make_initial_state
+class TrainableSpatialWalkingSystem(_BaseTrainableWalkingSystem):
+    def _init_params(self, key):
+        k1, k2 = jax.random.split(key, 2)
+        scale_in = 1.0 / np.sqrt(max(1, self.obs_size))
+        scale_out = 1.0 / np.sqrt(max(1, self.n_total))
+        return {
+            "w_in": jax.random.normal(k1, (self.obs_size, self.n_total)) * scale_in,
+            "bias_in": jnp.zeros((self.n_total,), dtype=jnp.float32),
+            "w_out": jax.random.normal(k2, (self.n_total, self.action_size)) * scale_out,
+            "bias_out": jnp.zeros((self.action_size,), dtype=jnp.float32),
+        }
 
-
-if jax is not None:
-
-    @jax.custom_jvp
-    def surrogate_spike(x):
-        return (x > 0.0).astype(x.dtype)
-
-
-    @surrogate_spike.defjvp
-    def _surrogate_spike_jvp(primals, tangents):
-        (x,), (x_dot,) = primals, tangents
-        y = surrogate_spike(x)
-        grad = 1.0 / (1.0 + jnp.abs(x)) ** 2
-        return y, grad * x_dot
-
-else:
-
-    def surrogate_spike(x):  # pragma: no cover - runtime guard catches this path.
-        raise ImportError("JAX is required for surrogate_spike().")
-
-
-@dataclass
-class Config:
-    random_seed: int = 7
-
-    # Compact trainable spatial controller.
-    rho: int = 6000
-    controller_dx_mm: float = 0.20
-    gamma: float = 4.0
-    sigma_mm: float = 0.050
-    conn_sparsity: float = 0.55
-    membrane_tau_ms: float = 18.0
-    synapse_tau_ms: float = 12.0
-    adapt_tau_ms: float = 80.0
-    adapt_strength: float = 0.35
-    v_th: float = 1.0
-    v_reset: float = 0.0
-    input_gain: float = 0.35
-    recurrent_gain: float = 0.18
-    readout_tau_ms: float = 24.0
-    readout_gain: float = 0.22
-    hip_action_scale: float = 0.42
-    knee_action_scale: float = 0.55
-
-    # BrainPy Spatial model.
-    # These are parameters for the src.models.Spatial model.
-    # Values are taken from the defaults in Spatial.__init__.
-    sigma_ee: float = 0.06
-    sigma_ei: float = 0.07
-    sigma_ie: float = 0.14
-    sigma_ii: float = 0.14
-    K_ee: int = 260
-    K_ei: int = 340
-    K_ie: int = 225
-    K_ii: int = 290
-    delta: float = 4.0
-    nu: float = 10.0
-    n_ext: int = 100
-    J_ee: float = 0.00105
-    J_ei: float = 0.00145
-    tau_r_e: float = 1.0
-    tau_r_i: float = 2.0
-    tau_d_e: float = 5.0
-    tau_d_i: float = 4.5
-    V_rev_e: float = 0.0
-    V_rev_i: float = -80.0
-    e_delay: float = 1.5
-    i_delay: float = 1.5
-    Delta_g_K: float = 0.002
-    bp_method: str = "exp_auto"
-
-    # Task / training.
-    target_vx: float = 0.40
-    target_vy: float = 0.0
-    episode_ms: float = 5000.0
-    dt_ms: float = 4.0
-    train_epochs: int = 0
-    learning_rate: float = 2e-3
-    adam_beta1: float = 0.9
-    adam_beta2: float = 0.999
-    adam_eps: float = 1e-8
-    weight_decay: float = 1e-5
-    gradient_clip: float = 1.0
-    eval_every: int = 5
-    vis_every: int = 5
-    ui_interval_ms: int = 40
-    optim_steps_per_tick: int = 1
-    animation_fps: float = 30.0
-    window_size_ms: float = 40.0
-    es_population: int = 4
-    es_noise_std: float = 0.03
-    es_reward_scale: float = 1.0
-
-    # Reward shaping.
-    reward_distance: float = 6.0
-    reward_speed: float = 2.5
-    penalty_speed_tracking: float = 4.0
-    penalty_height: float = 6.0
-    penalty_pitch: float = 4.0
-    penalty_energy: float = 0.01
-    penalty_action_rate: float = 0.03
-    penalty_slip: float = 0.10
-    penalty_collapse: float = 8.0
-    penalty_joint_limit: float = 0.5
-
-    # Exact Pymunk walker configuration. These mirror run_walking_physics.py.
-    n_legs: int = 2
-    mass: float = 2.0
-    thigh_mass: float = 0.25
-    shank_mass: float = 0.18
-    drag: float = 0.12
-    angular_drag: float = 1.2
-    joint_drag: float = 0.18
-    gravity: float = 9.81
-    ground_k: float = 1500.0
-    ground_c: float = 35.0
-    ground_tangent_damping: float = 80.0
-    friction_mu: float = 0.9
-    body_length: float = 0.45
-    body_height: float = 0.18
-    hip_x_offset: float = 0.16
-    thigh_length: float = 0.22
-    shank_length: float = 0.22
-    leg_radius: float = 0.022
-    foot_radius: float = 0.028
-    body_corner_radius: float = 0.012
-    height_target: float = 0.48
-    hip_limit: float = 0.95
-    knee_min: float = 0.05
-    knee_max: float = 1.45
-    hip_kp: float = 55.0
-    hip_kd: float = 6.0
-    knee_kp: float = 85.0
-    knee_kd: float = 8.0
-    hip_torque_limit: float = 18.0
-    knee_torque_limit: float = 24.0
-    physics_substeps: int = 10
-    solver_iterations: int = 50
-    collision_slop: float = 1e-3
-    contact_epsilon: float = 2e-3
-    drop_height: float = 0.16
-    initial_pitch: float = 0.22
-    initial_omega: float = 0.0
-    initial_body_x: float = 0.0
-    initial_body_vx: float = 0.0
-    initial_body_vy: float = 0.0
-    hip_offsets: tuple[float, float] = (0.18, -0.10)
-    knee_offsets: tuple[float, float] = (-0.10, 0.06)
-
-
-@dataclass
-class RolloutRunner:
-    mon: Dict[str, np.ndarray]
-
-
-@dataclass
-class AdamState:
-    step: int
-    m: Any
-    v: Any
-
-
-def build_feature_sequence(
-    num_steps: int,
-    dt_ms: float,
-    target_vx: float,
-    target_vy: float,
-) -> np.ndarray:
-    return np.stack(
-        [
-            np.full((num_steps,), target_vx, dtype=np.float32),
-            np.full((num_steps,), target_vy, dtype=np.float32),
-        ],
-        axis=1,
-    ).astype(np.float32)
-
-
-def _grid_positions(side: int, extent_mm: float) -> np.ndarray:
-    xs = np.linspace(0.0, extent_mm, side, dtype=float)
-    ys = np.linspace(0.0, extent_mm, side, dtype=float)
-    xx, yy = np.meshgrid(xs, ys, indexing="xy")
-    return np.stack([xx.reshape(-1), yy.reshape(-1)], axis=1)
-
-
-def _tree_global_norm(tree) -> Any:
-    leaves = jax.tree_util.tree_leaves(tree)
-    if not leaves:
-        return jnp.asarray(0.0, dtype=jnp.float32)
-    total = sum(jnp.sum(jnp.square(x)) for x in leaves)
-    return jnp.sqrt(total + 1e-12)
-
-
-def _tree_to_numpy(tree):
-    return jax.tree_util.tree_map(lambda x: np.asarray(x), tree)
-
-
-def _python_metrics(metrics: Dict[str, Any]) -> Dict[str, float]:
-    return {key: float(np.asarray(value)) for key, value in metrics.items()}
-
-
-def _queue_put_latest(message_queue, message):
-    try:
-        message_queue.put_nowait(message)
-        return
-    except queue.Full:
-        pass
-
-    try:
-        while True:
-            message_queue.get_nowait()
-    except queue.Empty:
-        pass
-
-    try:
-        message_queue.put_nowait(message)
-    except queue.Full:
-        pass
-
-
-def _log(message: str):
-    print(f"[trainable_system] {message}", flush=True)
-
-
-def _metrics_summary(metrics: Dict[str, float]) -> str:
-    fields = []
-    for key in ("loss", "reward", "distance", "mean_vx", "height_error", "pitch_error"):
-        if key in metrics:
-            fields.append(f"{key}={metrics[key]:.4f}")
-    if "grad_norm" in metrics:
-        fields.append(f"grad_norm={metrics['grad_norm']:.4f}")
-    return " ".join(fields)
-
-
-class TerminalProgressBar:
-    def __init__(self, total: int, label: str, width: int = 28):
-        self.total = max(1, int(total))
-        self.label = label
-        self.width = width
-        self.current = 0
-        self.start = time.perf_counter()
-        self._draw(0)
-
-    def _draw(self, current: int):
-        current = int(np.clip(current, 0, self.total))
-        frac = current / float(self.total)
-        filled = int(round(self.width * frac))
-        bar = "#" * filled + "-" * (self.width - filled)
-        elapsed = time.perf_counter() - self.start
-        print(
-            f"\r[trainable_spatial_system] {self.label:<24} [{bar}] "
-            f"{100.0 * frac:6.2f}% ({current:>4d}/{self.total:<4d}) "
-            f"{elapsed:6.1f}s",
-            end="",
-            flush=True,
-        )
-
-    def update(self, current: int):
-        if current <= self.current and current < self.total:
-            return
-        self.current = min(int(current), self.total)
-        self._draw(self.current)
-
-    def finish(self):
-        self.current = self.total
-        self._draw(self.total)
-        print("", flush=True)
-
-
-class TrainableWalkingSystem:
     def __init__(self, cfg: Config):
         _require_runtime()
-        if cfg.n_legs != 2:
-            raise ValueError("TrainableWalkingSystem currently expects n_legs == 2.")
+        super().__init__(cfg)
+        self.compute_backend = "pymunk+spatial"
 
-        self.cfg = cfg
-        self.num_steps = int(round(cfg.episode_ms / cfg.dt_ms))
-        if self.num_steps < 1:
-            raise ValueError("episode_ms must produce at least one simulation step.")
-        self.compute_backend = "pymunk"
-        self.rng = np.random.default_rng(cfg.random_seed)
+        bm.set_dt(cfg.dt_ms)
 
-        (
-            self.PymunkPassiveWalker,
-            self.passive_initial_joint_configuration,
-            self.make_initial_state,
-        ) = _import_pymunk_walker()
-
-        # --- Controller Setup ---
-        bp.math.set_dt(cfg.dt_ms)
-        key = jax.random.PRNGKey(cfg.random_seed)
-        key, model_key = jax.random.split(key)
-        self.controller = Spatial(
-            key=model_key,
+        spatial_key = jax.random.PRNGKey(cfg.random_seed)
+        self.spatial_model = Spatial(
+            key=spatial_key,
             rho=cfg.rho,
             dx=cfg.controller_dx_mm,
             gamma=cfg.gamma,
-            sigma_ee=cfg.sigma_ee, sigma_ei=cfg.sigma_ei,
-            sigma_ie=cfg.sigma_ie, sigma_ii=cfg.sigma_ii,
-            K_ee=cfg.K_ee, K_ei=cfg.K_ei, K_ie=cfg.K_ie, K_ii=cfg.K_ii,
-            delta=cfg.delta, nu=cfg.nu, n_ext=cfg.n_ext,
-            J_ee=cfg.J_ee, J_ei=cfg.J_ei,
-            tau_r_e=cfg.tau_r_e, tau_r_i=cfg.tau_r_i,
-            tau_d_e=cfg.tau_d_e, tau_d_i=cfg.tau_d_i,
-            V_rev_e=cfg.V_rev_e, V_rev_i=cfg.V_rev_i,
-            e_delay=cfg.e_delay, i_delay=cfg.i_delay,
-            Delta_g_K=cfg.Delta_g_K,
-            kernel=ExponentialKernel,
-            method=cfg.bp_method,
         )
 
-        self.n_exc = self.controller.E.num
-        self.n_inh = self.controller.I.num
+        self.exc_side = int(np.asarray(self.spatial_model.E.size, dtype=int)[0])
+        self.n_exc = int(np.prod(np.asarray(self.spatial_model.E.size, dtype=int)))
+        self.n_inh = int(np.prod(np.asarray(self.spatial_model.I.size, dtype=int)))
         self.n_total = self.n_exc + self.n_inh
-        self.E = self.controller.E
-        self.I = self.controller.I
-        # --- End Controller Setup ---
 
-        self.obs_size = 21
-        self.action_size = 2 * cfg.n_legs
-        self.observation_labels = [
-            "target vx", "target vy", "body y", "vel x", "vel y", "pitch", "omega",
-            "hip 0", "hip 1", "knee 0", "knee 1", "hip w0", "hip w1", "knee w0", "knee w1",
-            "foot y0", "foot y1", "foot vx0", "foot vx1", "contact 0", "contact 1",
-        ]
-        self.action_labels = ["hip 0", "hip 1", "knee 0", "knee 1"]
-
+        self.E = self.spatial_model.E
+        self.I = self.spatial_model.I
+        self.exc_positions = np.asarray(self.E.positions, dtype=np.float32).reshape(self.n_exc, 2)
+        self.inh_positions = np.asarray(self.I.positions, dtype=np.float32).reshape(self.n_inh, 2)
         self.all_positions = jnp.asarray(
-            np.concatenate([self.E.positions, self.I.positions], axis=0), dtype=jnp.float32
+            np.concatenate([self.exc_positions, self.inh_positions], axis=0),
+            dtype=jnp.float32,
         )
 
-        self.readout_decay = float(np.exp(-cfg.dt_ms / cfg.readout_tau_ms))
+        self.exc_mask = np.concatenate(
+            [np.ones((self.n_exc,), dtype=np.float32), np.zeros((self.n_inh,), dtype=np.float32)],
+            axis=0,
+        )
+        self.fixed_recurrent_weights = self._build_recurrent_weight_matrix()
 
-        nominal_hip, nominal_knee = self.passive_initial_joint_configuration(cfg)
-        self.base_hip = np.asarray([nominal_hip, nominal_hip], dtype=np.float32)
-        self.base_knee = np.asarray([nominal_knee, nominal_knee], dtype=np.float32)
+        if self.params["w_in"].shape[1] != self.n_total:
+            raise ValueError(
+                "Spatial controller size mismatch. "
+                f"Expected params width {self.n_total}, got {self.params['w_in'].shape[1]}."
+            )
 
-        self.obs_scale = np.asarray(
+    @staticmethod
+    def _shape_tuple(shape) -> tuple[int, ...]:
+        values = np.atleast_1d(np.asarray(shape, dtype=int)).tolist()
+        return tuple(int(v) for v in values)
+
+    @staticmethod
+    def _value_to_numpy(value) -> np.ndarray:
+        if hasattr(value, "value"):
+            value = value.value
+        return np.asarray(value, dtype=np.float32).reshape(-1)
+
+    @staticmethod
+    def _assign_input_var(input_var, value):
+        target = getattr(input_var, "input", input_var)
+        if hasattr(target, "value"):
+            target.value = bm.asarray(value)
+        else:
+            target[...] = bm.asarray(value)
+
+    @staticmethod
+    def _csr_to_dense(indices, indptr, weights, num_pre: int, num_post: int) -> np.ndarray:
+        dense = np.zeros((num_pre, num_post), dtype=np.float32)
+        idx = np.asarray(indices, dtype=int)
+        ptr = np.asarray(indptr, dtype=int)
+        w = np.asarray(weights, dtype=np.float32).reshape(-1)
+        for pre_idx in range(num_pre):
+            start = ptr[pre_idx]
+            stop = ptr[pre_idx + 1]
+            dense[pre_idx, idx[start:stop]] = w[start:stop]
+        return dense
+
+    def _projection_matrix(self, proj, num_pre: int, num_post: int, sign: float = 1.0) -> np.ndarray:
+        return sign * self._csr_to_dense(
+            proj.proj.comm.indices,
+            proj.proj.comm.indptr,
+            proj.proj.comm.weight,
+            num_pre=num_pre,
+            num_post=num_post,
+        )
+
+    def _build_recurrent_weight_matrix(self) -> np.ndarray:
+        weights = np.zeros((self.n_total, self.n_total), dtype=np.float32)
+        weights[: self.n_exc, : self.n_exc] = self._projection_matrix(
+            self.spatial_model.E2E,
+            num_pre=self.n_exc,
+            num_post=self.n_exc,
+            sign=1.0,
+        )
+        weights[: self.n_exc, self.n_exc :] = self._projection_matrix(
+            self.spatial_model.E2I,
+            num_pre=self.n_exc,
+            num_post=self.n_inh,
+            sign=1.0,
+        )
+        weights[self.n_exc :, : self.n_exc] = self._projection_matrix(
+            self.spatial_model.I2E,
+            num_pre=self.n_inh,
+            num_post=self.n_exc,
+            sign=-1.0,
+        )
+        weights[self.n_exc :, self.n_exc :] = self._projection_matrix(
+            self.spatial_model.I2I,
+            num_pre=self.n_inh,
+            num_post=self.n_inh,
+            sign=-1.0,
+        )
+        return weights
+
+    def _effective_recurrent_weights(self, params):
+        del params
+        return self.fixed_recurrent_weights
+
+    def _spatial_snapshot(self, filt: np.ndarray, step: int) -> dict[str, np.ndarray]:
+        spike = np.concatenate(
             [
-                max(1.0, abs(cfg.target_vx)), max(1.0, abs(cfg.target_vy)),
-                cfg.height_target, 1.0, 1.0, 0.7, 2.0,
-                cfg.hip_limit, cfg.hip_limit, cfg.knee_max, cfg.knee_max,
-                2.0, 2.0, 2.0, 2.0,
-                0.6, 0.6, 1.0, 1.0, 1.0, 1.0,
-            ],
-            dtype=np.float32,
-        )
-
-        key, param_key = jax.random.split(key)
-        self.params = _tree_to_numpy(self._init_params(param_key))
-        self._update_params_in_controller(self.params)
-        self.opt_state = self._adam_init(self.params)
-
-    def _init_params(self, key):
-        k1, k2 = jax.random.split(key)
-        scale_in = 1.0 / np.sqrt(max(1, self.obs_size))
-        scale_out = 1.0 / np.sqrt(max(1, self.n_total))
-
-        # Input and output weights are managed outside the BrainPy model.
-        w_in = jax.random.normal(k1, (self.obs_size, self.n_total)) * scale_in
-        w_out = jax.random.normal(k2, (self.n_total, self.action_size)) * scale_out
-        bias_out = jnp.zeros((self.action_size,), dtype=jnp.float32)
-
-        # Recurrent weights are extracted from the BrainPy model.
-        recurrent_weights = {
-            'E2E': self.controller.E2E.proj.comm.weight,
-            'E2I': self.controller.E2I.proj.comm.weight,
-            'I2E': self.controller.I2E.proj.comm.weight,
-            'I2I': self.controller.I2I.proj.comm.weight,
-            'ext2E': self.controller.ext2E.proj.comm.weight,
-            'ext2I': self.controller.ext2I.proj.comm.weight,
-        }
-        return {
-            "w_in": w_in,
-            "w_out": w_out,
-            "bias_out": bias_out,
-            "recurrent_weights": recurrent_weights,
-        }
-
-    def _adam_init(self, params) -> AdamState:
-        zeros = jax.tree_util.tree_map(lambda x: np.zeros_like(x, dtype=np.float32), params)
-        return AdamState(step=0, m=zeros, v=zeros)
-
-    def _adam_update(self, params, grads):
-        cfg = self.cfg
-        state = self.opt_state
-        step = state.step + 1
-        m = jax.tree_util.tree_map(
-            lambda mm, gg: cfg.adam_beta1 * mm + (1.0 - cfg.adam_beta1) * gg.astype(np.float32),
-            state.m,
-            grads,
-        )
-        v = jax.tree_util.tree_map(
-            lambda vv, gg: cfg.adam_beta2 * vv + (1.0 - cfg.adam_beta2) * np.square(gg),
-            state.v,
-            grads,
-        )
-        m_hat = jax.tree_util.tree_map(lambda mm: mm / (1.0 - cfg.adam_beta1**step), m)
-        v_hat = jax.tree_util.tree_map(lambda vv: vv / (1.0 - cfg.adam_beta2**step), v)
-        params = jax.tree_util.tree_map(
-            lambda pp, mm, vv: (1.0 - cfg.learning_rate * cfg.weight_decay) * pp
-            - cfg.learning_rate * mm / (np.sqrt(vv) + cfg.adam_eps),
-            params,
-            m_hat,
-            v_hat,
-        )
-        self.opt_state = AdamState(step=step, m=m, v=v)
-        return params
-
-    def _update_params_in_controller(self, params):
-        rec_weights = params["recurrent_weights"]
-        self.controller.E2E.proj.comm.weight = rec_weights['E2E']
-        self.controller.E2I.proj.comm.weight = rec_weights['E2I']
-        self.controller.I2E.proj.comm.weight = rec_weights['I2E']
-        self.controller.I2I.proj.comm.weight = rec_weights['I2I']
-        self.controller.ext2E.proj.comm.weight = rec_weights['ext2E']
-        self.controller.ext2I.proj.comm.weight = rec_weights['ext2I']
-
-    def _controller_initial_state(self):
-        self.controller.reset_state()
-        return {
-            "filt": np.zeros((self.n_total,), dtype=np.float32),
-        }
-
-    def _make_physics(self):
-        initial_state = self.make_initial_state(
-            self.cfg,
-            hip_offsets=np.asarray(self.cfg.hip_offsets, dtype=float),
-            knee_offsets=np.asarray(self.cfg.knee_offsets, dtype=float),
-        )
-        return self.PymunkPassiveWalker(self.cfg, initial_state)
-
-    def _controller_step(self, params, ctrl_state, obs):
-        # 1. Compute input current from observations.
-        # The `bias_rec` is removed as the BrainPy model handles internal dynamics.
-        current = self.cfg.input_gain * (obs @ params["w_in"])
-
-        # 2. Inject current into the BrainPy model.
-        self.controller.Ein.value = current[:self.n_exc]
-        self.controller.Iin.value = current[self.n_exc:]
-
-        # 3. Run a single step of the BrainPy model.
-        self.controller.update()
-
-        # 4. Get spikes and other state variables from the BrainPy model.
-        spike_e = self.controller.E.spike.astype(np.float32).flatten()
-        spike_i = self.controller.I.spike.astype(np.float32).flatten()
-        spike = np.concatenate([spike_e, spike_i])
-
-        v_e = self.controller.E.V.flatten()
-        v_i = self.controller.I.V.flatten()
-        v = np.concatenate([v_e, v_i])
-
-        adapt_e = self.controller.E.g_K.flatten()
-        adapt = np.concatenate([adapt_e, np.zeros_like(v_i)]) # No adaptation in I neurons
-
-        # 5. Update readout filter and compute action.
-        filt = self.readout_decay * ctrl_state["filt"] + spike
-        action = np.tanh(self.cfg.readout_gain * (filt @ params["w_out"] + params["bias_out"]))
-
-        # 6. Return new state.
-        return {
-            "v": v,
-            "syn": np.zeros_like(v),  # Synaptic current is internal to BrainPy model now
-            "adapt": adapt,
-            "spike": spike,
-            "filt": filt,
-        }, action
-
-    def _build_observation(self, state_like, feature_t):
-        obs = np.concatenate(
-            [
-                feature_t,
-                np.asarray([state_like.pos[1]], dtype=np.float32),
-                np.asarray(state_like.vel, dtype=np.float32),
-                np.asarray([state_like.angle, state_like.omega], dtype=np.float32),
-                np.asarray(state_like.hip_angle, dtype=np.float32),
-                np.asarray(state_like.knee_angle, dtype=np.float32),
-                np.asarray(state_like.hip_omega, dtype=np.float32),
-                np.asarray(state_like.knee_omega, dtype=np.float32),
-                np.asarray(state_like.foot_pos[:, 1], dtype=np.float32),
-                np.asarray(state_like.foot_vel[:, 0], dtype=np.float32),
-                np.asarray(state_like.ground_contact, dtype=np.float32),
+                self._value_to_numpy(self.spatial_model.E.spike),
+                self._value_to_numpy(self.spatial_model.I.spike),
             ],
             axis=0,
         )
-        return obs / self.obs_scale
-
-    def _decode_targets(self, action):
-        hip = np.clip(
-            self.base_hip + self.cfg.hip_action_scale * action[: self.cfg.n_legs],
-            -self.cfg.hip_limit,
-            self.cfg.hip_limit,
+        membrane = np.concatenate(
+            [
+                self._value_to_numpy(self.spatial_model.E.V),
+                self._value_to_numpy(self.spatial_model.I.V),
+            ],
+            axis=0,
         )
-        knee = np.clip(
-            self.base_knee + self.cfg.knee_action_scale * action[self.cfg.n_legs :],
-            self.cfg.knee_min,
-            self.cfg.knee_max,
+        syn_current = np.concatenate(
+            [
+                self._value_to_numpy(self.spatial_model.E.input),
+                self._value_to_numpy(self.spatial_model.I.input),
+            ],
+            axis=0,
         )
-        return hip, knee
-
-    def _coerce_features(self, features: Optional[np.ndarray]) -> Any:
-        if features is None:
-            features = build_feature_sequence(
-                self.num_steps,
-                self.cfg.dt_ms,
-                self.cfg.target_vx,
-                self.cfg.target_vy,
-            )
-        features = np.asarray(features, dtype=np.float32)
-        if features.shape != (self.num_steps, 2):
-            raise ValueError(
-                f"Expected features with shape {(self.num_steps, 2)}, got {features.shape}."
-            )
-        return features
-
-    def _simulate(self, params, features, progress_label: Optional[str] = None):
-        self._update_params_in_controller(params)
-        physics = self._make_physics()
-        sensed = physics.observe()
-        ctrl_state = self._controller_initial_state()
-        progress = None
-        progress_stride = None
-        if progress_label:
-            progress = TerminalProgressBar(self.num_steps, progress_label)
-            progress_stride = max(1, self.num_steps // 40)
-
-        pos = []
-        vel = []
-        angle = []
-        omega = []
-        hip_angle = []
-        knee_angle = []
-        foot_pos = []
-        foot_vel = []
-        ground_contact = []
-        force = []
-        joint_torque = []
-        obs_hist = []
-        action_hist = []
-        spike_hist = []
-        v_hist = []
-        syn_hist = []
-        adapt_hist = []
-        filt_hist = []
-
-        for t in range(self.num_steps):
-            obs = self._build_observation(sensed, features[t])
-            ctrl_state, action = self._controller_step(params, ctrl_state, obs)
-            hip_target, knee_target = self._decode_targets(action)
-            physics.step(hip_target=hip_target, knee_target=knee_target)
-            sensed = physics.observe()
-
-            pos.append(np.asarray(sensed.pos, dtype=np.float32))
-            vel.append(np.asarray(sensed.vel, dtype=np.float32))
-            angle.append(np.asarray(sensed.angle, dtype=np.float32))
-            omega.append(np.asarray(sensed.omega, dtype=np.float32))
-            hip_angle.append(np.asarray(sensed.hip_angle, dtype=np.float32))
-            knee_angle.append(np.asarray(sensed.knee_angle, dtype=np.float32))
-            foot_pos.append(np.asarray(sensed.foot_pos, dtype=np.float32))
-            foot_vel.append(np.asarray(sensed.foot_vel, dtype=np.float32))
-            ground_contact.append(np.asarray(sensed.ground_contact, dtype=np.float32))
-            force.append(np.asarray(sensed.total_ground_force, dtype=np.float32))
-            joint_torque.append(np.asarray(physics.last_joint_torque, dtype=np.float32))
-            obs_hist.append(obs)
-            action_hist.append(action)
-            spike_hist.append(ctrl_state["spike"])
-            v_hist.append(ctrl_state["v"])
-            syn_hist.append(ctrl_state["syn"])
-            adapt_hist.append(ctrl_state["adapt"])
-            filt_hist.append(ctrl_state["filt"])
-            if progress is not None and ((t + 1) % progress_stride == 0 or (t + 1) == self.num_steps):
-                progress.update(t + 1)
-
-        spikes = np.stack(spike_hist, axis=0).astype(np.float32)
-        if progress is not None:
-            progress.finish()
+        adaptation = np.concatenate(
+            [
+                self._value_to_numpy(self.spatial_model.E.g_K),
+                self._value_to_numpy(self.spatial_model.I.g_K),
+            ],
+            axis=0,
+        )
         return {
-            "ts": np.arange(self.num_steps, dtype=np.float32) * self.cfg.dt_ms,
-            "pos": np.stack(pos, axis=0).astype(np.float32),
-            "vel": np.stack(vel, axis=0).astype(np.float32),
-            "angle": np.stack(angle, axis=0).astype(np.float32),
-            "omega": np.stack(omega, axis=0).astype(np.float32),
-            "hip_angle": np.stack(hip_angle, axis=0).astype(np.float32),
-            "knee_angle": np.stack(knee_angle, axis=0).astype(np.float32),
-            "foot_pos": np.stack(foot_pos, axis=0).astype(np.float32),
-            "foot_vel": np.stack(foot_vel, axis=0).astype(np.float32),
-            "ground_contact": np.stack(ground_contact, axis=0).astype(np.float32),
-            "force": np.stack(force, axis=0).astype(np.float32),
-            "joint_torque": np.stack(joint_torque, axis=0).astype(np.float32),
-            "obs": np.stack(obs_hist, axis=0).astype(np.float32),
-            "action": np.stack(action_hist, axis=0).astype(np.float32),
-            "spike": spikes,
-            "v": np.stack(v_hist, axis=0).astype(np.float32),
-            "syn": np.stack(syn_hist, axis=0).astype(np.float32),
-            "adapt": np.stack(adapt_hist, axis=0).astype(np.float32),
-            "filtered_spike": np.stack(filt_hist, axis=0).astype(np.float32),
-            "E.spike": spikes[:, : self.n_exc],
-            "I.spike": spikes[:, self.n_exc :],
+            "step": int(step),
+            "v": membrane.astype(np.float32),
+            "syn": syn_current.astype(np.float32),
+            "adapt": adaptation.astype(np.float32),
+            "spike": spike.astype(np.float32),
+            "filt": np.asarray(filt, dtype=np.float32),
         }
 
-    def _metrics_from_rollout(self, rollout, features):
-        cfg = self.cfg
-        pos = rollout["pos"]
-        vel = rollout["vel"]
-        angle = rollout["angle"]
-        contact = rollout["ground_contact"]
-        foot_vel = rollout["foot_vel"]
-        action = rollout["action"]
-        joint_torque = rollout["joint_torque"]
-        hip_angle = rollout["hip_angle"]
-        knee_angle = rollout["knee_angle"]
+    def _controller_initial_state(self):
+        bp.reset_state(self.spatial_model)
+        filt = np.zeros((self.n_total,), dtype=np.float32)
+        return self._spatial_snapshot(filt=filt, step=0)
 
-        distance = pos[-1, 0] - pos[0, 0]
-        mean_vx = float(np.mean(vel[:, 0]))
-        speed_tracking = float(np.mean(np.square(vel[:, 0] - cfg.target_vx)))
-        speed_tracking = speed_tracking + 0.25 * float(np.mean(np.square(vel[:, 1] - cfg.target_vy)))
-        height_error = float(np.mean(np.square(pos[:, 1] - cfg.height_target)))
-        pitch_error = float(np.mean(np.square(angle)))
-        energy = float(np.mean(np.sum(np.square(joint_torque), axis=(1, 2))))
-        if action.shape[0] > 1:
-            action_rate = float(np.mean(np.sum(np.square(action[1:] - action[:-1]), axis=1)))
-        else:
-            action_rate = 0.0
-        slip = float(np.mean(np.sum(contact * np.square(foot_vel[:, :, 0]), axis=1)))
-        collapse = float(np.mean(np.square(np.maximum(0.30 - pos[:, 1], 0.0))))
-        hip_limit_penalty = float(np.mean(
-            np.square(np.maximum(np.abs(hip_angle) - 0.95 * cfg.hip_limit, 0.0))
-        ))
-        knee_limit_penalty = float(np.mean(
-            np.square(np.maximum(cfg.knee_min + 0.02 - knee_angle, 0.0))
-            + np.square(np.maximum(knee_angle - (cfg.knee_max - 0.02), 0.0))
-        ))
-        joint_limit_penalty = hip_limit_penalty + knee_limit_penalty
+    def _controller_step(self, params, ctrl_state, obs):
+        obs = np.asarray(obs, dtype=np.float32)
+        drive = self.cfg.input_gain * (obs @ params["w_in"]) + params["bias_in"]
+        e_drive = drive[: self.n_exc].reshape(self._shape_tuple(self.spatial_model.E.size))
+        i_drive = drive[self.n_exc :].reshape(self._shape_tuple(self.spatial_model.I.size))
 
-        reward = cfg.reward_distance * distance + cfg.reward_speed * mean_vx
-        reward = reward - cfg.penalty_speed_tracking * speed_tracking
-        reward = reward - cfg.penalty_height * height_error
-        reward = reward - cfg.penalty_pitch * pitch_error
-        reward = reward - cfg.penalty_energy * energy
-        reward = reward - cfg.penalty_action_rate * action_rate
-        reward = reward - cfg.penalty_slip * slip
-        reward = reward - cfg.penalty_collapse * collapse
-        reward = reward - cfg.penalty_joint_limit * joint_limit_penalty
+        self._assign_input_var(self.spatial_model.Ein, e_drive.astype(np.float32))
+        self._assign_input_var(self.spatial_model.Iin, i_drive.astype(np.float32))
+        self.spatial_model.step_run(int(ctrl_state["step"]))
 
-        loss = -reward
-        metrics = {
-            "loss": float(loss),
-            "reward": float(reward),
-            "distance": float(distance),
-            "mean_vx": float(mean_vx),
-            "height_error": float(height_error),
-            "pitch_error": float(pitch_error),
-            "speed_tracking": float(speed_tracking),
-        }
-        return loss, metrics
+        spike = np.concatenate(
+            [
+                self._value_to_numpy(self.spatial_model.E.spike),
+                self._value_to_numpy(self.spatial_model.I.spike),
+            ],
+            axis=0,
+        ).astype(np.float32)
+        filt = self.readout_decay * np.asarray(ctrl_state["filt"], dtype=np.float32) + spike
+        action = np.tanh(self.cfg.readout_gain * (filt @ params["w_out"] + params["bias_out"]))
 
-    def train_step(
-        self,
-        features: Optional[np.ndarray] = None,
-        progress_prefix: Optional[str] = None,
-    ) -> Dict[str, float]:
-        features = self._coerce_features(features)
-        sigma = float(self.cfg.es_noise_std)
-        population = max(1, int(self.cfg.es_population))
-        grad_accum = jax.tree_util.tree_map(lambda p: np.zeros_like(p, dtype=np.float32), self.params)
-        step_prefix = progress_prefix or "optimizer step"
+        next_state = self._spatial_snapshot(filt=filt, step=int(ctrl_state["step"]) + 1)
+        return next_state, action.astype(np.float32)
 
-        _log(f"{step_prefix}: estimating gradient with {population} perturbation pairs")
 
-        for sample_idx in range(population):
-            sample_tag = f"{step_prefix} pair {sample_idx + 1}/{population}"
-            noise = jax.tree_util.tree_map(
-                lambda p: self.rng.standard_normal(p.shape).astype(np.float32),
-                self.params,
-            )
-            params_plus = jax.tree_util.tree_map(lambda p, n: p + sigma * n, self.params, noise)
-            params_minus = jax.tree_util.tree_map(lambda p, n: p - sigma * n, self.params, noise)
-            rollout_plus = self._simulate(params_plus, features, progress_label=f"{sample_tag} (+)")
-            reward_plus = self._metrics_from_rollout(rollout_plus, features)[1]["reward"]
-            rollout_minus = self._simulate(params_minus, features, progress_label=f"{sample_tag} (-)")
-            reward_minus = self._metrics_from_rollout(rollout_minus, features)[1]["reward"]
-            coeff = self.cfg.es_reward_scale * (reward_plus - reward_minus) / (2.0 * sigma * population)
-            grad_accum = jax.tree_util.tree_map(
-                lambda g, n: g + coeff * n,
-                grad_accum,
-                noise,
-            )
-            _log(
-                f"{sample_tag}: reward_plus={reward_plus:.4f} "
-                f"reward_minus={reward_minus:.4f} coeff={coeff:.4f}"
-            )
-
-        grad_norm = float(_tree_global_norm(grad_accum))
-        if grad_norm > self.cfg.gradient_clip > 0.0:
-            scale = self.cfg.gradient_clip / (grad_norm + 1e-8)
-            grad_accum = jax.tree_util.tree_map(lambda g: g * scale, grad_accum)
-            _log(f"{step_prefix}: clipped gradient to norm {self.cfg.gradient_clip:.4f}")
-
-        _log(f"{step_prefix}: applying Adam update")
-        self.params = self._adam_update(self.params, grad_accum)
-        rollout = self._simulate(self.params, features, progress_label=f"{step_prefix} eval")
-        loss, metrics = self._metrics_from_rollout(rollout, features)
-        metrics["loss"] = float(loss)
-        metrics["grad_norm"] = grad_norm
-        _log(f"{step_prefix}: complete {_metrics_summary(metrics)}")
-        return metrics
-
-    def evaluate(self, features: Optional[np.ndarray] = None):
-        features = self._coerce_features(features)
-        rollout = self._simulate(self.params, features)
-        _, metrics = self._metrics_from_rollout(rollout, features)
-        return rollout, metrics
-
-    def evaluate_with_progress(
-        self, features: Optional[np.ndarray] = None, progress_label: str = "rollout"
-    ):
-        features = self._coerce_features(features)
-        rollout = self._simulate(self.params, features, progress_label=progress_label)
-        _, metrics = self._metrics_from_rollout(rollout, features)
-        return rollout, metrics
+TrainableWalkingSystem = TrainableSpatialWalkingSystem
 
 
 def collect_rollout(
@@ -804,51 +254,9 @@ def collect_rollout(
     return RolloutRunner(mon=rollout)
 
 
-def prepare_spike_histograms_for_times(
-    system: TrainableWalkingSystem,
-    runner: RolloutRunner,
-    frame_times: np.ndarray,
-    window_size_ms: float,
-    progress_label: Optional[str] = None,
-):
-    ts = np.asarray(runner.mon["ts"], dtype=float)
-    e_spikes = np.asarray(runner.mon["E.spike"], dtype=float)
-    e_positions = np.asarray(system.E.positions, dtype=float)
-    domain = np.asarray(system.E.embedding.domain, dtype=float)
-    grid_size = np.asarray(system.E.size, dtype=int)
-
-    x_edges = np.linspace(0.0, domain[0], grid_size[0] + 1)
-    y_edges = np.linspace(0.0, domain[1], grid_size[1] + 1)
-    histograms = np.zeros((len(frame_times), grid_size[0], grid_size[1]), dtype=float)
-    progress = None
-    progress_stride = None
-    if progress_label:
-        progress = TerminalProgressBar(len(frame_times), progress_label)
-        progress_stride = max(1, len(frame_times) // 40)
-
-    for i, frame_t in enumerate(frame_times):
-        win_start_t = frame_t - window_size_ms
-        idx_start = np.searchsorted(ts, win_start_t, side="left")
-        idx_end = np.searchsorted(ts, frame_t, side="right")
-        spike_counts = np.sum(e_spikes[idx_start:idx_end, :], axis=0)
-        hist, _, _ = np.histogram2d(
-            e_positions[:, 0],
-            e_positions[:, 1],
-            bins=[x_edges, y_edges],
-            weights=spike_counts,
-        )
-        histograms[i] = hist
-        if progress is not None and ((i + 1) % progress_stride == 0 or (i + 1) == len(frame_times)):
-            progress.update(i + 1)
-
-    if progress is not None:
-        progress.finish()
-    return histograms, domain
-
-
 def _training_worker(cfg: Config, features: np.ndarray, message_queue, stop_event):
     try:
-        _log("backend worker booting")
+        _log("spatial backend worker booting")
         system = TrainableWalkingSystem(cfg)
         refresh_every = cfg.vis_every if cfg.vis_every > 0 else cfg.eval_every
         train_forever = cfg.train_epochs <= 0
@@ -857,7 +265,7 @@ def _training_worker(cfg: Config, features: np.ndarray, message_queue, stop_even
             None if train_forever else TerminalProgressBar(max(1, cfg.train_epochs), "training epochs")
         )
         _log(
-            f"backend ready: epochs={total_epochs_label} refresh_every={refresh_every} "
+            f"spatial backend ready: epochs={total_epochs_label} refresh_every={refresh_every} "
             f"es_population={cfg.es_population}"
         )
 
@@ -869,12 +277,12 @@ def _training_worker(cfg: Config, features: np.ndarray, message_queue, stop_even
                 "detail": "running initial rollout",
             },
         )
-        _log("starting initial rollout for viewer bootstrap")
+        _log("starting initial spatial rollout for viewer bootstrap")
         rollout, metrics = system.evaluate_with_progress(
             features,
             progress_label="initial rollout",
         )
-        _log(f"initial rollout complete {_metrics_summary(metrics)}")
+        _log(f"initial spatial rollout complete {_metrics_summary(metrics)}")
         _queue_put_latest(
             message_queue,
             {
@@ -898,7 +306,7 @@ def _training_worker(cfg: Config, features: np.ndarray, message_queue, stop_even
                     "detail": "running optimizer step",
                 },
             )
-            _log(f"epoch {epoch + 1}/{total_epochs_label}: starting optimizer step")
+            _log(f"epoch {epoch + 1}/{total_epochs_label}: starting spatial optimizer step")
             latest_metrics = system.train_step(
                 features,
                 progress_prefix=f"epoch {epoch + 1}/{total_epochs_label}",
@@ -906,7 +314,10 @@ def _training_worker(cfg: Config, features: np.ndarray, message_queue, stop_even
             epoch += 1
             if epoch_progress is not None:
                 epoch_progress.update(epoch)
-            _log(f"epoch {epoch}/{total_epochs_label}: optimizer step complete {_metrics_summary(latest_metrics)}")
+            _log(
+                f"epoch {epoch}/{total_epochs_label}: spatial optimizer step complete "
+                f"{_metrics_summary(latest_metrics)}"
+            )
 
             _queue_put_latest(
                 message_queue,
@@ -925,7 +336,7 @@ def _training_worker(cfg: Config, features: np.ndarray, message_queue, stop_even
                 or (not train_forever and epoch >= cfg.train_epochs)
             )
             if should_refresh and not stop_event.is_set():
-                _log(f"epoch {epoch}/{total_epochs_label}: refreshing viewer rollout")
+                _log(f"epoch {epoch}/{total_epochs_label}: refreshing spatial viewer rollout")
                 _queue_put_latest(
                     message_queue,
                     {
@@ -938,7 +349,10 @@ def _training_worker(cfg: Config, features: np.ndarray, message_queue, stop_even
                     features,
                     progress_label="refresh rollout",
                 )
-                _log(f"epoch {epoch}/{total_epochs_label}: refresh rollout complete {_metrics_summary(eval_metrics)}")
+                _log(
+                    f"epoch {epoch}/{total_epochs_label}: refresh spatial rollout complete "
+                    f"{_metrics_summary(eval_metrics)}"
+                )
                 _queue_put_latest(
                     message_queue,
                     {
@@ -954,7 +368,7 @@ def _training_worker(cfg: Config, features: np.ndarray, message_queue, stop_even
 
         if epoch_progress is not None:
             epoch_progress.finish()
-        _log(f"training worker finished at epoch {epoch}/{total_epochs_label}")
+        _log(f"spatial training worker finished at epoch {epoch}/{total_epochs_label}")
         _queue_put_latest(
             message_queue,
             {
@@ -965,7 +379,7 @@ def _training_worker(cfg: Config, features: np.ndarray, message_queue, stop_even
             },
         )
     except Exception as exc:  # pragma: no cover - worker-side runtime path.
-        _log(f"backend worker failed: {exc}")
+        _log(f"spatial backend worker failed: {exc}")
         _queue_put_latest(
             message_queue,
             {
@@ -976,805 +390,13 @@ def _training_worker(cfg: Config, features: np.ndarray, message_queue, stop_even
         )
 
 
-class TrainingViewer:
-    def __init__(
-        self,
-        system: TrainableWalkingSystem,
-        features: np.ndarray,
-        message_queue,
-        stop_event,
-        worker_process,
-    ):
-        self.system = system
-        self.cfg = system.cfg
-        self.features = features
-        self.message_queue = message_queue
-        self.stop_event = stop_event
-        self.worker_process = worker_process
-        self.closed = False
-        self.epoch = 0
-        self.last_epoch_seen = -1
-
-        self.history_steps = []
-        self.history_distance = []
-        self.history_speed = []
-        self.history_loss = []
-
-        self.latest_rollout = None
-        self.latest_metrics = None
-        self.frame_indices = np.asarray([0], dtype=int)
-        self.frame_times = np.asarray([0.0], dtype=float)
-        self.frame_ptr = 0
-        self.current_phase = "starting"
-        self.phase_detail = "initializing viewer"
-        self.last_phase_seconds = 0.0
-        self.train_tick_count = 0
-        self.start_time = time.perf_counter()
-        self.last_log_time = self.start_time
-        self.worker_done = False
-        self.robot_y_limits = (0.0, 1.0)
-        self.camera_half_width = max(
-            0.5,
-            self.cfg.body_length + self.cfg.thigh_length + self.cfg.shank_length + 0.2,
-        )
-        self.latest_params = _tree_to_numpy(system.params)
-        self.filtered_node_scale = 1.0
-        self.adapt_node_scale = 1.0
-        self.max_recurrent_edges = 420
-        self.max_input_edges_per_channel = 5
-        self.max_output_edges_per_command = 14
-        self.leg_colors = ["tab:blue", "tab:orange"]
-        self.rollout_cache: Dict[str, np.ndarray] = {}
-        self.hip_local = np.array(
-            [
-                [self.cfg.hip_x_offset, -0.5 * self.cfg.body_height],
-                [-self.cfg.hip_x_offset, -0.5 * self.cfg.body_height],
-            ],
-            dtype=float,
-        )
-        self.body_outline_local = np.array(
-            [
-                [0.5 * self.cfg.body_length, 0.5 * self.cfg.body_height],
-                [0.5 * self.cfg.body_length, -0.5 * self.cfg.body_height],
-                [-0.5 * self.cfg.body_length, -0.5 * self.cfg.body_height],
-                [-0.5 * self.cfg.body_length, 0.5 * self.cfg.body_height],
-                [0.5 * self.cfg.body_length, 0.5 * self.cfg.body_height],
-            ],
-            dtype=float,
-        )
-
-        self.fig = plt.figure(figsize=(18, 10))
-        outer = self.fig.add_gridspec(1, 2, width_ratios=[1.8, 0.95], wspace=0.24)
-        self.ax_net = self.fig.add_subplot(outer[0, 0])
-        right = outer[0, 1].subgridspec(2, 1, height_ratios=[1.7, 1.0], hspace=0.32)
-        self.ax_robot = self.fig.add_subplot(right[0, 0])
-        self.ax_metric = self.fig.add_subplot(right[1, 0])
-
-        self._init_network_panel()
-        self._init_robot_panel()
-        self._init_metric_panel()
-
-        self.fig.canvas.mpl_connect("close_event", self._on_close)
-
-        self._set_phase("starting", "viewer ready, waiting for backend")
-
-        self.anim_timer = self.fig.canvas.new_timer(
-            interval=max(1, int(round(1000.0 / self.cfg.animation_fps)))
-        )
-        self.anim_timer.add_callback(self._on_anim_tick)
-
-        self.train_timer = self.fig.canvas.new_timer(interval=max(1, self.cfg.ui_interval_ms))
-        self.train_timer.add_callback(self._on_train_tick)
-
-    def _init_network_panel(self):
-        self.ax_net.set_facecolor("#ffffff")
-        self.ax_net.set_xlim(0.0, 1.0)
-        self.ax_net.set_ylim(0.0, 1.0)
-        self.ax_net.set_aspect("equal", adjustable="box")
-        self.ax_net.set_box_aspect(1.0)
-        self.ax_net.set_xticks([])
-        self.ax_net.set_yticks([])
-        for spine in self.ax_net.spines.values():
-            spine.set_visible(False)
-
-        self.ax_net.add_patch(
-            plt.Rectangle(
-                (0.24, 0.08),
-                0.52,
-                0.84,
-                facecolor="#f4f7fb",
-                edgecolor="#c5d0dc",
-                lw=1.4,
-                alpha=1.0,
-                zorder=0,
-            )
-        )
-        self.ax_net.text(0.08, 0.96, "Inputs", ha="center", va="top", color="#435569", fontsize=10)
-        self.ax_net.text(0.50, 0.96, "Recurrent Sheet", ha="center", va="top", color="#435569", fontsize=10)
-        self.ax_net.text(0.92, 0.96, "Outputs", ha="center", va="top", color="#435569", fontsize=10)
-
-        self.input_node_positions = np.column_stack(
-            [
-                np.full((self.system.obs_size,), 0.08, dtype=float),
-                np.linspace(0.90, 0.10, self.system.obs_size, dtype=float),
-            ]
-        )
-        self.output_node_positions = np.column_stack(
-            [
-                np.full((self.system.action_size,), 0.92, dtype=float),
-                np.linspace(0.66, 0.34, self.system.action_size, dtype=float),
-            ]
-        )
-        self.exc_canvas_positions = self._controller_to_canvas(self.system.exc_positions)
-        self.inh_canvas_positions = self._controller_to_canvas(self.system.I.positions)
-        self.all_canvas_positions = np.concatenate(
-            [self.exc_canvas_positions, self.inh_canvas_positions], axis=0
-        )
-
-        for idx, label in enumerate(self.system.observation_labels):
-            self.ax_net.text(
-                0.015,
-                self.input_node_positions[idx, 1],
-                label,
-                ha="left",
-                va="center",
-                color="#2b3a48",
-                fontsize=6.8,
-            )
-        for idx, label in enumerate(self.system.action_labels):
-            label_color = self.leg_colors[idx % self.cfg.n_legs]
-            self.ax_net.text(
-                0.985,
-                self.output_node_positions[idx, 1],
-                label,
-                ha="right",
-                va="center",
-                color=label_color,
-                fontsize=8.0,
-            )
-        self.output_target_texts = [
-            self.ax_net.text(
-                self.output_node_positions[idx, 0],
-                self.output_node_positions[idx, 1] - 0.040,
-                "",
-                ha="center",
-                va="top",
-                color=self.leg_colors[idx % self.cfg.n_legs],
-                fontsize=6.8,
-                family="monospace",
-                zorder=7,
-            )
-            for idx in range(self.system.action_size)
-        ]
-
-        self.rec_lines = LineCollection([], zorder=1, capstyle="round", joinstyle="round")
-        self.input_lines = LineCollection([], zorder=2, capstyle="round")
-        self.output_lines = LineCollection([], zorder=2, capstyle="round")
-        self.ax_net.add_collection(self.rec_lines)
-        self.ax_net.add_collection(self.input_lines)
-        self.ax_net.add_collection(self.output_lines)
-
-        self.input_nodes = self.ax_net.scatter(
-            self.input_node_positions[:, 0],
-            self.input_node_positions[:, 1],
-            s=np.full((self.system.obs_size,), 55.0),
-            c=np.zeros((self.system.obs_size,), dtype=float),
-            cmap="coolwarm",
-            vmin=-2.0,
-            vmax=2.0,
-            edgecolors="#314252",
-            linewidths=0.9,
-            zorder=4,
-        )
-        self.output_nodes = self.ax_net.scatter(
-            self.output_node_positions[:, 0],
-            self.output_node_positions[:, 1],
-            s=np.full((self.system.action_size,), 90.0),
-            c=np.zeros((self.system.action_size,), dtype=float),
-            cmap="coolwarm",
-            vmin=-1.0,
-            vmax=1.0,
-            edgecolors="#314252",
-            linewidths=1.1,
-            zorder=4,
-        )
-
-        exc_edge = np.tile(np.asarray([[0.98, 0.72, 0.28, 0.95]]), (self.system.n_exc, 1))
-        inh_edge = np.tile(np.asarray([[0.36, 0.84, 1.0, 0.98]]), (self.system.n_inh, 1))
-        self.exc_nodes = self.ax_net.scatter(
-            self.exc_canvas_positions[:, 0],
-            self.exc_canvas_positions[:, 1],
-            s=np.full((self.system.n_exc,), 18.0),
-            c=np.zeros((self.system.n_exc,), dtype=float),
-            cmap="viridis",
-            vmin=0.0,
-            vmax=max(1.0, self.cfg.v_th),
-            edgecolors=exc_edge,
-            linewidths=np.full((self.system.n_exc,), 0.55),
-            zorder=5,
-        )
-        self.inh_nodes = self.ax_net.scatter(
-            self.inh_canvas_positions[:, 0],
-            self.inh_canvas_positions[:, 1],
-            s=np.full((self.system.n_inh,), 26.0),
-            marker="s",
-            c=np.zeros((self.system.n_inh,), dtype=float),
-            cmap="viridis",
-            vmin=0.0,
-            vmax=max(1.0, self.cfg.v_th),
-            edgecolors=inh_edge,
-            linewidths=np.full((self.system.n_inh,), 0.70),
-            zorder=5,
-        )
-        self.exc_spike_rings = self.ax_net.scatter(
-            self.exc_canvas_positions[:, 0],
-            self.exc_canvas_positions[:, 1],
-            s=np.zeros((self.system.n_exc,), dtype=float),
-            facecolors="none",
-            edgecolors="#111111",
-            linewidths=np.zeros((self.system.n_exc,), dtype=float),
-            zorder=6,
-        )
-        self.inh_spike_rings = self.ax_net.scatter(
-            self.inh_canvas_positions[:, 0],
-            self.inh_canvas_positions[:, 1],
-            s=np.zeros((self.system.n_inh,), dtype=float),
-            marker="s",
-            facecolors="none",
-            edgecolors="#111111",
-            linewidths=np.zeros((self.system.n_inh,), dtype=float),
-            zorder=6,
-        )
-        self._update_network_weight_artists()
-
-    def _init_robot_panel(self):
-        self.ax_robot.set_aspect("equal", adjustable="box")
-        self.ax_robot.set_xlabel("x")
-        self.ax_robot.set_ylabel("y")
-        self.ax_robot.axhline(0.0, color="0.65", lw=1.0)
-
-        self.path_line, = self.ax_robot.plot([], [], color="0.75", lw=1.5)
-        self.body_box, = self.ax_robot.plot([], [], "-", color="black", lw=2)
-        self.body_com, = self.ax_robot.plot([], [], "o", color="black", ms=4)
-        self.thighs = [
-            self.ax_robot.plot([], [], "-", lw=2, color=self.leg_colors[leg_idx])[0]
-            for leg_idx in range(self.cfg.n_legs)
-        ]
-        self.shanks = [
-            self.ax_robot.plot([], [], "-", lw=2, color=self.leg_colors[leg_idx])[0]
-            for leg_idx in range(self.cfg.n_legs)
-        ]
-        self.knees = [
-            self.ax_robot.plot([], [], "o", color=self.leg_colors[leg_idx], ms=3)[0]
-            for leg_idx in range(self.cfg.n_legs)
-        ]
-        self.feet = [
-            self.ax_robot.plot([], [], "o", color=self.leg_colors[leg_idx], ms=4)[0]
-            for leg_idx in range(self.cfg.n_legs)
-        ]
-        self.force_line, = self.ax_robot.plot([], [], "-", color="tab:red", lw=2)
-
-    def _init_metric_panel(self):
-        self.distance_line, = self.ax_metric.plot([], [], color="tab:blue", label="distance")
-        self.speed_line, = self.ax_metric.plot([], [], color="tab:green", label="mean vx")
-        self.ax_metric.set_title("Training Progress")
-        self.ax_metric.set_xlabel("epoch")
-        self.ax_metric.legend(loc="upper left")
-        self.ax_metric.grid(alpha=0.25)
-
-    def _init_status_panel(self):
-        return None
-
-    def _controller_to_canvas(self, positions: np.ndarray) -> np.ndarray:
-        positions = np.asarray(positions, dtype=float)
-        x = 0.26 + 0.48 * (positions[:, 0] / self.cfg.controller_dx_mm)
-        y = 0.10 + 0.80 * (positions[:, 1] / self.cfg.controller_dx_mm)
-        return np.column_stack([x, y])
-
-    def _select_top_recurrent_edges(self, weights: np.ndarray):
-        pre_idx, post_idx = np.nonzero(np.abs(weights) > 0.0)
-        if len(pre_idx) == 0:
-            return (
-                np.zeros((0,), dtype=int),
-                np.zeros((0,), dtype=int),
-                np.zeros((0,), dtype=float),
-            )
-        values = weights[pre_idx, post_idx]
-        keep = min(self.max_recurrent_edges, len(values))
-        order = np.argsort(np.abs(values))[-keep:]
-        return pre_idx[order], post_idx[order], values[order]
-
-    def _select_input_edges(self, weights: np.ndarray):
-        src_idx = []
-        dst_idx = []
-        values = []
-        for src in range(weights.shape[0]):
-            row = weights[src]
-            keep = min(self.max_input_edges_per_channel, row.shape[0])
-            if keep <= 0:
-                continue
-            order = np.argsort(np.abs(row))[-keep:]
-            src_idx.extend([src] * keep)
-            dst_idx.extend(order.tolist())
-            values.extend(row[order].tolist())
-        return np.asarray(src_idx, dtype=int), np.asarray(dst_idx, dtype=int), np.asarray(values, dtype=float)
-
-    def _select_output_edges(self, weights: np.ndarray):
-        src_idx = []
-        dst_idx = []
-        values = []
-        for dst in range(weights.shape[1]):
-            col = weights[:, dst]
-            keep = min(self.max_output_edges_per_command, col.shape[0])
-            if keep <= 0:
-                continue
-            order = np.argsort(np.abs(col))[-keep:]
-            src_idx.extend(order.tolist())
-            dst_idx.extend([dst] * keep)
-            values.extend(col[order].tolist())
-        return np.asarray(src_idx, dtype=int), np.asarray(dst_idx, dtype=int), np.asarray(values, dtype=float)
-
-    def _line_style(
-        self,
-        values: np.ndarray,
-        activity: Optional[np.ndarray] = None,
-        positive_rgb=(1.00, 0.58, 0.22),
-        negative_rgb=(0.22, 0.78, 1.00),
-        alpha_floor: float = 0.04,
-        width_floor: float = 0.25,
-    ):
-        values = np.asarray(values, dtype=float)
-        if values.size == 0:
-            return np.zeros((0, 4), dtype=float), np.zeros((0,), dtype=float)
-        scale = max(1e-6, float(np.percentile(np.abs(values), 95.0)))
-        strength = np.clip(np.abs(values) / scale, 0.0, 1.0)
-        if activity is None:
-            activity = np.ones_like(strength)
-        else:
-            activity = np.clip(np.asarray(activity, dtype=float), 0.0, 1.0)
-        colors = np.zeros((values.size, 4), dtype=float)
-        pos_mask = values >= 0.0
-        colors[pos_mask, :3] = positive_rgb
-        colors[~pos_mask, :3] = negative_rgb
-        colors[:, 3] = alpha_floor + 0.65 * strength * (0.30 + 0.70 * activity)
-        widths = width_floor + 2.2 * strength * (0.35 + 0.65 * activity)
-        return colors, widths
-
-    def _update_network_weight_artists(self):
-        params = _tree_to_numpy(self.latest_params)
-        self.current_w_in = np.asarray(params["w_in"], dtype=float)
-        self.current_w_out = np.asarray(params["w_out"], dtype=float)
-        self.current_w_rec = np.asarray(self.system._effective_recurrent_weights(params), dtype=float)
-
-        self.rec_edge_pre, self.rec_edge_post, self.rec_edge_values = self._select_top_recurrent_edges(
-            self.current_w_rec
-        )
-        if self.rec_edge_values.size:
-            rec_segments = np.stack(
-                [
-                    self.all_canvas_positions[self.rec_edge_pre],
-                    self.all_canvas_positions[self.rec_edge_post],
-                ],
-                axis=1,
-            )
-            self.rec_lines.set_segments(rec_segments)
-        else:
-            self.rec_lines.set_segments([])
-
-        self.in_edge_src, self.in_edge_dst, self.in_edge_values = self._select_input_edges(self.current_w_in)
-        if self.in_edge_values.size:
-            in_segments = np.stack(
-                [
-                    self.input_node_positions[self.in_edge_src],
-                    self.all_canvas_positions[self.in_edge_dst],
-                ],
-                axis=1,
-            )
-            self.input_lines.set_segments(in_segments)
-        else:
-            self.input_lines.set_segments([])
-
-        self.out_edge_src, self.out_edge_dst, self.out_edge_values = self._select_output_edges(self.current_w_out)
-        if self.out_edge_values.size:
-            out_segments = np.stack(
-                [
-                    self.all_canvas_positions[self.out_edge_src],
-                    self.output_node_positions[self.out_edge_dst],
-                ],
-                axis=1,
-            )
-            self.output_lines.set_segments(out_segments)
-        else:
-            self.output_lines.set_segments([])
-
-        self._refresh_network_edge_styles(
-            np.zeros((self.system.obs_size,), dtype=float),
-            np.zeros((self.system.action_size,), dtype=float),
-            np.zeros((self.system.n_total,), dtype=float),
-        )
-
-    def _refresh_network_edge_styles(self, obs: np.ndarray, action: np.ndarray, filtered: np.ndarray):
-        obs = np.asarray(obs, dtype=float)
-        action = np.asarray(action, dtype=float)
-        filtered = np.asarray(filtered, dtype=float)
-        filt_scale = max(1e-6, self.filtered_node_scale)
-
-        if self.rec_edge_values.size:
-            rec_activity = 0.5 * (
-                filtered[self.rec_edge_pre] / filt_scale + filtered[self.rec_edge_post] / filt_scale
-            )
-            colors, widths = self._line_style(
-                self.rec_edge_values,
-                activity=rec_activity,
-                positive_rgb=(0.98, 0.60, 0.20),
-                negative_rgb=(0.24, 0.78, 0.98),
-                alpha_floor=0.03,
-                width_floor=0.18,
-            )
-            self.rec_lines.set_colors(colors)
-            self.rec_lines.set_linewidths(widths)
-
-        if self.in_edge_values.size:
-            input_activity = np.abs(obs[self.in_edge_src]) / 2.0
-            colors, widths = self._line_style(
-                self.in_edge_values,
-                activity=input_activity,
-                positive_rgb=(0.95, 0.72, 0.28),
-                negative_rgb=(0.44, 0.85, 1.00),
-                alpha_floor=0.06,
-                width_floor=0.35,
-            )
-            self.input_lines.set_colors(colors)
-            self.input_lines.set_linewidths(widths)
-
-        if self.out_edge_values.size:
-            output_activity = np.abs(action[self.out_edge_dst])
-            colors, widths = self._line_style(
-                self.out_edge_values,
-                activity=output_activity,
-                positive_rgb=(0.99, 0.54, 0.26),
-                negative_rgb=(0.40, 0.88, 1.00),
-                alpha_floor=0.06,
-                width_floor=0.35,
-            )
-            self.output_lines.set_colors(colors)
-            self.output_lines.set_linewidths(widths)
-
-    def _update_neural_canvas(
-        self,
-        t_ms: float,
-        obs: np.ndarray,
-        action: np.ndarray,
-        membrane: np.ndarray,
-        filtered: np.ndarray,
-        adapt: np.ndarray,
-        spike: np.ndarray,
-    ):
-        obs = np.asarray(obs, dtype=float)
-        action = np.asarray(action, dtype=float)
-        membrane = np.asarray(membrane, dtype=float)
-        filtered = np.asarray(filtered, dtype=float)
-        adapt = np.asarray(adapt, dtype=float)
-        spike = np.asarray(spike, dtype=float)
-
-        exc_mem = membrane[: self.system.n_exc]
-        inh_mem = membrane[self.system.n_exc :]
-        exc_filt = filtered[: self.system.n_exc]
-        inh_filt = filtered[self.system.n_exc :]
-        exc_adapt = adapt[: self.system.n_exc]
-        inh_adapt = adapt[self.system.n_exc :]
-        exc_spike = spike[: self.system.n_exc]
-        inh_spike = spike[self.system.n_exc :]
-
-        exc_sizes = 14.0 + 140.0 * np.clip(exc_filt / max(1e-6, self.filtered_node_scale), 0.0, 1.0)
-        inh_sizes = 18.0 + 150.0 * np.clip(inh_filt / max(1e-6, self.filtered_node_scale), 0.0, 1.0)
-        exc_lw = 0.55 + 2.5 * np.clip(exc_adapt / max(1e-6, self.adapt_node_scale), 0.0, 1.0)
-        inh_lw = 0.70 + 2.3 * np.clip(inh_adapt / max(1e-6, self.adapt_node_scale), 0.0, 1.0)
-
-        self.exc_nodes.set_array(exc_mem)
-        self.inh_nodes.set_array(inh_mem)
-        self.exc_nodes.set_sizes(exc_sizes)
-        self.inh_nodes.set_sizes(inh_sizes)
-        self.exc_nodes.set_linewidths(exc_lw)
-        self.inh_nodes.set_linewidths(inh_lw)
-
-        self.exc_spike_rings.set_sizes(np.where(exc_spike > 0.0, exc_sizes + 52.0, 0.0))
-        self.inh_spike_rings.set_sizes(np.where(inh_spike > 0.0, inh_sizes + 58.0, 0.0))
-        self.exc_spike_rings.set_linewidths(np.where(exc_spike > 0.0, 1.6, 0.0))
-        self.inh_spike_rings.set_linewidths(np.where(inh_spike > 0.0, 1.7, 0.0))
-
-        self.input_nodes.set_array(obs)
-        self.output_nodes.set_array(action)
-        self.input_nodes.set_sizes(42.0 + 150.0 * np.clip(np.abs(obs) / 2.0, 0.0, 1.0))
-        self.output_nodes.set_sizes(78.0 + 220.0 * np.clip(np.abs(action), 0.0, 1.0))
-
-        hip_target, knee_target = self.system._decode_targets(action.astype(np.float32))
-        target_values = np.concatenate([hip_target, knee_target], axis=0)
-        for idx, text in enumerate(self.output_target_texts):
-            text.set_text(f"{target_values[idx]:+.2f} rad")
-
-        self._refresh_network_edge_styles(obs, action, filtered)
-
-    def _set_phase(self, phase: str, detail: str):
-        self.current_phase = phase
-        self.phase_detail = detail
-
-    def _on_close(self, _event):
-        self.closed = True
-        self.stop_event.set()
-        self.anim_timer.stop()
-        self.train_timer.stop()
-
-    def _record_metrics(self, epoch: int, metrics: Dict[str, float]):
-        if epoch <= self.last_epoch_seen:
-            return
-        self.last_epoch_seen = epoch
-        self.epoch = epoch
-        self.latest_metrics = metrics
-        self.history_steps.append(epoch)
-        self.history_distance.append(metrics["distance"])
-        self.history_speed.append(metrics["mean_vx"])
-        self.history_loss.append(metrics["loss"])
-
-    def _drain_backend_messages(self):
-        received = False
-        while True:
-            try:
-                message = self.message_queue.get_nowait()
-            except queue.Empty:
-                break
-
-            received = True
-            msg_type = message.get("type")
-            phase = message.get("phase")
-            detail = message.get("detail")
-            if phase is not None and detail is not None:
-                self._set_phase(phase, detail)
-
-            if msg_type == "status":
-                continue
-
-            if msg_type == "metrics":
-                self._record_metrics(int(message["epoch"]), message["metrics"])
-                continue
-
-            if msg_type == "snapshot":
-                self._record_metrics(int(message["epoch"]), message["metrics"])
-                if "params" in message and message["params"] is not None:
-                    self.latest_params = _tree_to_numpy(message["params"])
-                    self.system.params = self.latest_params
-                    self._update_network_weight_artists()
-                self._set_rollout(message["rollout"], message["metrics"])
-                continue
-
-            if msg_type == "done":
-                self.worker_done = True
-                self.epoch = max(self.epoch, int(message.get("epoch", self.epoch)))
-                self._set_phase("done", message.get("detail", "training complete"))
-                continue
-
-            if msg_type == "error":
-                self.worker_done = True
-                self._set_phase("error", message.get("detail", "backend failed"))
-                print(
-                    "[trainable_spatial_system] backend error: "
-                    f"{message.get('detail', 'unknown error')}",
-                    flush=True,
-                )
-        return received
-
-    def _rotation_matrix(self, theta: float) -> np.ndarray:
-        c = np.cos(theta)
-        s = np.sin(theta)
-        return np.array([[c, -s], [s, c]], dtype=float)
-
-    def _world_points(self, local_points: np.ndarray, body_pos: np.ndarray, theta: float) -> np.ndarray:
-        return local_points @ self._rotation_matrix(theta).T + body_pos[None, :]
-
-    def _segment_dir(self, joint_angle: float) -> np.ndarray:
-        return np.array([np.sin(joint_angle), -np.cos(joint_angle)], dtype=float)
-
-    def _set_rollout(self, rollout, metrics):
-        self.latest_rollout = rollout
-        self.latest_metrics = metrics
-
-        ts_ms = np.asarray(rollout["ts"], dtype=float)
-        frame_stride = max(1, int(round((1000.0 / self.cfg.animation_fps) / self.cfg.dt_ms)))
-        frame_indices = np.arange(0, len(ts_ms), frame_stride, dtype=int)
-        if len(frame_indices) == 0 or frame_indices[-1] != len(ts_ms) - 1:
-            frame_indices = np.append(frame_indices, len(ts_ms) - 1)
-        self.frame_indices = frame_indices
-        self.frame_times = ts_ms[frame_indices]
-        self.frame_ptr = 0
-
-        self.rollout_cache = {
-            key: np.asarray(rollout[key], dtype=float)
-            for key in (
-                "pos",
-                "angle",
-                "hip_angle",
-                "knee_angle",
-                "foot_pos",
-                "force",
-                "obs",
-                "action",
-                "v",
-                "filtered_spike",
-                "adapt",
-                "spike",
-            )
-        }
-
-        membrane = self.rollout_cache["v"]
-        filtered = self.rollout_cache["filtered_spike"]
-        adapt = self.rollout_cache["adapt"]
-        v_lo = float(min(0.0, np.percentile(membrane, 1.0)))
-        v_hi = float(max(self.cfg.v_th, np.percentile(membrane, 99.0)))
-        self.exc_nodes.set_clim(v_lo, v_hi)
-        self.inh_nodes.set_clim(v_lo, v_hi)
-        self.filtered_node_scale = float(max(1.0, np.percentile(filtered, 99.0)))
-        self.adapt_node_scale = float(max(1.0, np.percentile(adapt, 99.0)))
-
-        pos = self.rollout_cache["pos"]
-        foot_pos = self.rollout_cache["foot_pos"]
-        min_y = float(
-            min(
-                np.min(pos[:, 1]) - self.cfg.body_height,
-                np.min(foot_pos[:, :, 1]) - 0.05,
-                0.0,
-            )
-        )
-        max_y = float(
-            max(
-                np.max(pos[:, 1]) + self.cfg.body_height,
-                np.max(foot_pos[:, :, 1]) + 0.15,
-                self.cfg.height_target + 0.08,
-            )
-        )
-        self.robot_y_limits = (min_y, max_y)
-        self.camera_half_width = max(
-            0.5,
-            self.cfg.body_length + self.cfg.thigh_length + self.cfg.shank_length + 0.2,
-        )
-        self.ax_robot.set_ylim(*self.robot_y_limits)
-        self.force_scale = 0.35 * self.cfg.body_length / max(
-            1.0, float(np.max(np.linalg.norm(self.rollout_cache["force"], axis=1)))
-        )
-        self._draw_frame(0)
-
-    def _draw_frame(self, frame_ptr: int):
-        if self.latest_rollout is None:
-            return
-        frame_ptr = int(np.clip(frame_ptr, 0, len(self.frame_indices) - 1))
-        self.frame_ptr = frame_ptr
-        i = int(self.frame_indices[frame_ptr])
-
-        pos = self.rollout_cache["pos"]
-        angle = self.rollout_cache["angle"]
-        hip_angle = self.rollout_cache["hip_angle"]
-        knee_angle = self.rollout_cache["knee_angle"]
-        foot_pos = self.rollout_cache["foot_pos"]
-        force = self.rollout_cache["force"]
-        obs = self.rollout_cache["obs"]
-        action = self.rollout_cache["action"]
-        membrane = self.rollout_cache["v"]
-        filtered = self.rollout_cache["filtered_spike"]
-        adapt = self.rollout_cache["adapt"]
-        spike = self.rollout_cache["spike"]
-        self._update_neural_canvas(
-            self.frame_times[frame_ptr],
-            obs[i],
-            action[i],
-            membrane[i],
-            filtered[i],
-            adapt[i],
-            spike[i],
-        )
-
-        p = pos[i]
-        theta = float(angle[i])
-        hip_pos = self._world_points(self.hip_local, p, theta)
-        body_outline = self._world_points(self.body_outline_local, p, theta)
-
-        self.path_line.set_data(pos[: i + 1, 0], pos[: i + 1, 1])
-        self.body_box.set_data(body_outline[:, 0], body_outline[:, 1])
-        self.body_com.set_data([p[0]], [p[1]])
-
-        for leg_idx in range(self.cfg.n_legs):
-            hip = hip_pos[leg_idx]
-            thigh_abs = theta + float(hip_angle[i, leg_idx])
-            knee_abs = thigh_abs + float(knee_angle[i, leg_idx])
-            knee_pos = hip + self.cfg.thigh_length * self._segment_dir(thigh_abs)
-            foot = foot_pos[i, leg_idx]
-            self.thighs[leg_idx].set_data([hip[0], knee_pos[0]], [hip[1], knee_pos[1]])
-            self.shanks[leg_idx].set_data([knee_pos[0], foot[0]], [knee_pos[1], foot[1]])
-            self.knees[leg_idx].set_data([knee_pos[0]], [knee_pos[1]])
-            self.feet[leg_idx].set_data([foot[0]], [max(0.0, foot[1])])
-
-        f = force[i]
-        self.force_line.set_data(
-            [p[0], p[0] + f[0] * self.force_scale],
-            [p[1], p[1] + f[1] * self.force_scale],
-        )
-        self.ax_robot.set_xlim(p[0] - self.camera_half_width, p[0] + self.camera_half_width)
-        self.ax_robot.set_title(
-            "Walker Rollout | "
-            f"epoch={self.epoch} | x={p[0]:.3f} y={p[1]:.3f} pitch={theta:.3f}"
-        )
-
-    def _refresh_status(self):
-        return None
-
-    def _refresh_metric_plot(self):
-        if not self.history_steps:
-            return
-        x = np.asarray(self.history_steps, dtype=float)
-        self.distance_line.set_data(x, np.asarray(self.history_distance, dtype=float))
-        self.speed_line.set_data(x, np.asarray(self.history_speed, dtype=float))
-        self.ax_metric.set_xlim(0.0, max(1.0, x[-1]))
-
-        y_values = np.concatenate(
-            [
-                np.asarray(self.history_distance, dtype=float),
-                np.asarray(self.history_speed, dtype=float),
-            ]
-        )
-        ymin = float(np.min(y_values))
-        ymax = float(np.max(y_values))
-        if abs(ymax - ymin) < 1e-6:
-            ymax = ymin + 1.0
-        pad = 0.1 * (ymax - ymin)
-        self.ax_metric.set_ylim(ymin - pad, ymax + pad)
-
-    def _on_anim_tick(self):
-        if self.closed or self.latest_rollout is None:
-            return
-        next_ptr = (self.frame_ptr + 1) % len(self.frame_indices)
-        self._draw_frame(next_ptr)
-        self.fig.canvas.draw_idle()
-
-    def _on_train_tick(self):
-        if self.closed:
-            return
-        self.train_tick_count += 1
-        changed = self._drain_backend_messages()
-        if not self.worker_process.is_alive() and not self.worker_done:
-            self.worker_done = True
-            if self.current_phase not in {"done", "error"}:
-                self._set_phase("done", "backend exited")
-
-        if self.worker_done and self.current_phase != "error":
-            self.train_timer.stop()
-        if changed:
-            now = time.perf_counter()
-            if self.latest_metrics is not None and (now - self.last_log_time) >= 0.5:
-                total_epochs_label = "inf" if self.cfg.train_epochs <= 0 else str(self.cfg.train_epochs)
-                print(
-                    "[trainable_spatial_system] "
-                    f"epoch={self.epoch}/{total_epochs_label} "
-                    f"phase={self.current_phase} "
-                    f"loss={self.latest_metrics['loss']:.4f} "
-                    f"distance={self.latest_metrics['distance']:.4f} "
-                    f"vx={self.latest_metrics['mean_vx']:.4f}",
-                    flush=True,
-                )
-                self.last_log_time = now
-        self._refresh_metric_plot()
-        self.fig.canvas.draw_idle()
-
-    def show(self):
-        self.anim_timer.start()
-        self.train_timer.start()
-        plt.show()
-
-
 def main():
     _require_runtime()
     print("[trainable_spatial_system] building system...", flush=True)
     cfg = Config()
     system = TrainableWalkingSystem(cfg)
     print(
-        f"[trainable_spatial_system] system ready "
+        "[trainable_spatial_system] system ready "
         f"(steps={system.num_steps}, exc={system.n_exc}, inh={system.n_inh}, "
         f"backend={system.compute_backend})",
         flush=True,
@@ -1811,6 +433,7 @@ __all__ = [
     "AdamState",
     "Config",
     "RolloutRunner",
+    "TrainableSpatialWalkingSystem",
     "TrainableWalkingSystem",
     "build_feature_sequence",
     "collect_rollout",
