@@ -135,6 +135,7 @@ class Config:
     es_population: int = 4
     es_noise_std: float = 0.03
     es_reward_scale: float = 1.0
+    rollout_workers: int = 0
     camera_width: float = 2.4
     camera_height_pad: float = 0.18
 
@@ -262,6 +263,31 @@ def _queue_put_latest(message_queue, message):
         message_queue.put_nowait(message)
     except queue.Full:
         pass
+
+
+_ROLLOUT_WORKER_SYSTEM = None
+_ROLLOUT_WORKER_FEATURES = None
+
+
+def _resolve_rollout_workers(cfg: Config) -> int:
+    if cfg.rollout_workers > 0:
+        return int(cfg.rollout_workers)
+    cpu_count = os.cpu_count() or 1
+    if cpu_count <= 2:
+        return 1
+    return max(1, min(cpu_count - 1, 2 * max(1, int(cfg.es_population))))
+
+
+def _init_rollout_worker(cfg: Config, features: np.ndarray):
+    global _ROLLOUT_WORKER_SYSTEM, _ROLLOUT_WORKER_FEATURES
+    _ROLLOUT_WORKER_SYSTEM = TrainableWalkingSystem(cfg)
+    _ROLLOUT_WORKER_FEATURES = np.asarray(features, dtype=np.float32)
+
+
+def _rollout_reward_task(params) -> float:
+    rollout = _ROLLOUT_WORKER_SYSTEM._simulate(params, _ROLLOUT_WORKER_FEATURES)
+    _, metrics = _ROLLOUT_WORKER_SYSTEM._metrics_from_rollout(rollout, _ROLLOUT_WORKER_FEATURES)
+    return float(metrics["reward"])
 
 
 class TerminalProgressBar:
@@ -692,11 +718,12 @@ class TrainableWalkingSystem:
         }
         return loss, metrics
 
-    def train_step(self, features: Optional[np.ndarray] = None) -> Dict[str, float]:
+    def train_step(self, features: Optional[np.ndarray] = None, rollout_pool=None) -> Dict[str, float]:
         features = self._coerce_features(features)
         sigma = float(self.cfg.es_noise_std)
         population = max(1, int(self.cfg.es_population))
         grad_accum = jax.tree_util.tree_map(lambda p: np.zeros_like(p, dtype=np.float32), self.params)
+        perturbations = []
 
         for _ in range(population):
             noise = jax.tree_util.tree_map(
@@ -705,8 +732,26 @@ class TrainableWalkingSystem:
             )
             params_plus = jax.tree_util.tree_map(lambda p, n: p + sigma * n, self.params, noise)
             params_minus = jax.tree_util.tree_map(lambda p, n: p - sigma * n, self.params, noise)
-            reward_plus = self._metrics_from_rollout(self._simulate(params_plus, features), features)[1]["reward"]
-            reward_minus = self._metrics_from_rollout(self._simulate(params_minus, features), features)[1]["reward"]
+            perturbations.append((noise, params_plus, params_minus))
+
+        if rollout_pool is None:
+            rewards = []
+            for _, params_plus, params_minus in perturbations:
+                reward_plus = self._metrics_from_rollout(self._simulate(params_plus, features), features)[1]["reward"]
+                reward_minus = self._metrics_from_rollout(self._simulate(params_minus, features), features)[1]["reward"]
+                rewards.append((reward_plus, reward_minus))
+        else:
+            task_params = []
+            for _, params_plus, params_minus in perturbations:
+                task_params.append(params_plus)
+                task_params.append(params_minus)
+            task_rewards = rollout_pool.map(_rollout_reward_task, task_params)
+            rewards = [
+                (task_rewards[2 * i], task_rewards[2 * i + 1])
+                for i in range(len(perturbations))
+            ]
+
+        for (noise, _, _), (reward_plus, reward_minus) in zip(perturbations, rewards):
             coeff = self.cfg.es_reward_scale * (reward_plus - reward_minus) / (2.0 * sigma * population)
             grad_accum = jax.tree_util.tree_map(
                 lambda g, n: g + coeff * n,
@@ -791,9 +836,29 @@ def prepare_spike_histograms_for_times(
 
 
 def _training_worker(cfg: Config, features: np.ndarray, message_queue, stop_event):
+    rollout_pool = None
     try:
         system = TrainableWalkingSystem(cfg)
         refresh_every = cfg.vis_every if cfg.vis_every > 0 else cfg.eval_every
+        rollout_workers = _resolve_rollout_workers(cfg)
+        if rollout_workers > 1:
+            ctx = mp.get_context("spawn")
+            rollout_pool = ctx.Pool(
+                processes=rollout_workers,
+                initializer=_init_rollout_worker,
+                initargs=(cfg, features),
+            )
+        _queue_put_latest(
+            message_queue,
+            {
+                "type": "status",
+                "phase": "starting",
+                "detail": (
+                    f"trainer ready ({'parallel' if rollout_pool is not None else 'serial'} "
+                    f"rollouts, workers={rollout_workers if rollout_pool is not None else 1})"
+                ),
+            },
+        )
 
         _queue_put_latest(
             message_queue,
@@ -829,7 +894,7 @@ def _training_worker(cfg: Config, features: np.ndarray, message_queue, stop_even
                     "detail": "running optimizer step",
                 },
             )
-            latest_metrics = system.train_step(features)
+            latest_metrics = system.train_step(features, rollout_pool=rollout_pool)
             epoch += 1
 
             _queue_put_latest(
@@ -887,6 +952,10 @@ def _training_worker(cfg: Config, features: np.ndarray, message_queue, stop_even
                 "detail": str(exc),
             },
         )
+    finally:
+        if rollout_pool is not None:
+            rollout_pool.close()
+            rollout_pool.join()
 
 
 class TrainingViewer:
@@ -1340,7 +1409,7 @@ def main():
     print(
         "[trainable_system] system ready "
         f"(steps={system.num_steps}, exc={system.n_exc}, inh={system.n_inh}, "
-        f"backend={system.compute_backend})",
+        f"backend={system.compute_backend}, rollout_workers={_resolve_rollout_workers(cfg)})",
         flush=True,
     )
     features = build_feature_sequence(
@@ -1355,7 +1424,6 @@ def main():
     worker_process = ctx.Process(
         target=_training_worker,
         args=(cfg, features, message_queue, stop_event),
-        daemon=True,
     )
     print("[trainable_system] starting backend worker...", flush=True)
     worker_process.start()
