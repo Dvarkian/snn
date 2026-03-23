@@ -28,7 +28,7 @@ import warnings
 import math
 import time
 from types import SimpleNamespace
-from typing import Dict, List, Tuple, Optional
+from typing import Callable, Dict, List, Tuple, Optional
 
 import numpy as np
 
@@ -1063,6 +1063,39 @@ class DashboardState:
             }
 
 
+def make_progress_status_updater(
+    state: DashboardState, prefix: str
+) -> Callable[[str, float], None]:
+    last_status = {"value": None}
+
+    def _update(stage: str, percent: float) -> None:
+        pct = int(np.clip(round(float(percent)), 0, 100))
+        status = f"{prefix}: {stage} ({pct}%)"
+        if status != last_status["value"]:
+            state.set_status(status)
+            last_status["value"] = status
+
+    return _update
+
+
+def make_subprogress(
+    progress: Optional[Callable[[str, float], None]],
+    stage: str,
+    start_percent: float,
+    end_percent: float,
+) -> Optional[Callable[[float], None]]:
+    if progress is None:
+        return None
+
+    span = float(end_percent) - float(start_percent)
+
+    def _update(fraction: float) -> None:
+        clipped = float(np.clip(fraction, 0.0, 1.0))
+        progress(stage, start_percent + span * clipped)
+
+    return _update
+
+
 def train_system(cfg: Config, dashboard_state: Optional[DashboardState] = None):
     bm.set_dt(cfg.dt_ms)
     system = TrainableWalkingSystem(cfg)
@@ -1095,9 +1128,11 @@ def train_system(cfg: Config, dashboard_state: Optional[DashboardState] = None):
     }
 
     if dashboard_state is not None:
-        dashboard_state.set_status("Preparing initial rollout...")
+        progress = make_progress_status_updater(
+            dashboard_state, "Preparing initial rollout"
+        )
         initial_snapshot = build_rollout_snapshot(
-            system, rollout_features, cfg, epoch=0
+            system, rollout_features, cfg, epoch=0, progress=progress
         )
         history["forward"].append((0, initial_snapshot.forward_end))
         dashboard_state.append_forward(0, initial_snapshot.forward_end)
@@ -1135,11 +1170,16 @@ def train_system(cfg: Config, dashboard_state: Optional[DashboardState] = None):
 
         snapshot = None
         if dashboard_state is not None and (eval_due or snapshot_due or final_due):
-            dashboard_state.set_status(
-                f"Collecting rollout for epoch {epoch + 1}/{cfg.train_epochs}..."
+            progress = make_progress_status_updater(
+                dashboard_state,
+                f"Collecting rollout for epoch {epoch + 1}/{cfg.train_epochs}",
             )
             snapshot = build_rollout_snapshot(
-                system, rollout_features, cfg, epoch=epoch + 1
+                system,
+                rollout_features,
+                cfg,
+                epoch=epoch + 1,
+                progress=progress,
             )
 
         if eval_due:
@@ -1698,12 +1738,16 @@ def prepare_spike_histograms(
     ts: np.ndarray,
     window_ms: float,
     frame_step_ms: float,
+    progress: Optional[Callable[[float], None]] = None,
 ):
     frame_times = np.arange(ts[0], ts[-1] + frame_step_ms, frame_step_ms)
     x_edges = np.linspace(0, domain[0], grid_size[0] + 1)
     y_edges = np.linspace(0, domain[1], grid_size[1] + 1)
 
     histograms = np.zeros((len(frame_times), grid_size[0], grid_size[1]), dtype=float)
+    if progress is not None:
+        progress(0.0)
+    progress_stride = max(1, len(frame_times) // 25) if len(frame_times) > 0 else 1
     for i, frame_t in enumerate(frame_times):
         win_start = frame_t - window_ms
         idx_start = np.searchsorted(ts, win_start, side="left")
@@ -1716,6 +1760,10 @@ def prepare_spike_histograms(
             weights=spike_counts,
         )
         histograms[i] = hist
+        if progress is not None and (
+            i == len(frame_times) - 1 or (i + 1) % progress_stride == 0
+        ):
+            progress((i + 1) / max(1, len(frame_times)))
     return histograms, frame_times
 
 
@@ -1896,12 +1944,13 @@ def collect_rollout(
     system: TrainableWalkingSystem,
     features: bm.Array,
     backend: str = "pymunk",
+    progress: Optional[Callable[[float], None]] = None,
 ):
     previous_backend = system.physics_backend
     system.set_physics_backend(backend)
     try:
         if backend == "pymunk":
-            return _collect_rollout_python(system, features)
+            return _collect_rollout_python(system, features, progress=progress)
 
         runner = bp.DSRunner(
             system,
@@ -1930,7 +1979,11 @@ def collect_rollout(
         system.set_physics_backend(previous_backend)
 
 
-def _collect_rollout_python(system: TrainableWalkingSystem, features: bm.Array):
+def _collect_rollout_python(
+    system: TrainableWalkingSystem,
+    features: bm.Array,
+    progress: Optional[Callable[[float], None]] = None,
+):
     system.reset_state()
 
     num_steps = int(features.shape[0])
@@ -1952,6 +2005,11 @@ def _collect_rollout_python(system: TrainableWalkingSystem, features: bm.Array):
         "ts": [],
     }
 
+    if progress is not None:
+        progress(0.0)
+
+    progress_stride = max(1, num_steps // 50) if num_steps > 0 else 1
+
     for i in range(num_steps):
         bp.share.save(t=i * dt, i=i, dt=dt)
         system(features[i])
@@ -1972,6 +2030,11 @@ def _collect_rollout_python(system: TrainableWalkingSystem, features: bm.Array):
         mon["ts"].append(i * dt)
 
         clear_input(system)
+
+        if progress is not None and (
+            i == num_steps - 1 or (i + 1) % progress_stride == 0
+        ):
+            progress((i + 1) / max(1, num_steps))
 
     stacked = {key: np.asarray(value) for key, value in mon.items()}
     return SimpleNamespace(mon=stacked)
@@ -2002,9 +2065,18 @@ def build_rollout_snapshot(
     features: bm.Array,
     cfg: Config,
     epoch: int,
+    progress: Optional[Callable[[str, float], None]] = None,
 ) -> RolloutSnapshot:
-    runner = collect_rollout(system, features)
+    if progress is not None:
+        progress("simulating walker", 0.0)
+    runner = collect_rollout(
+        system,
+        features,
+        progress=make_subprogress(progress, "simulating walker", 0.0, 72.0),
+    )
 
+    if progress is not None:
+        progress("packing rollout traces", 74.0)
     spikes = np.asarray(runner.mon["E.spike"])
     pos = np.asarray(runner.mon["pos"], dtype=float)
     vel = np.asarray(runner.mon["vel"], dtype=float)
@@ -2023,6 +2095,8 @@ def build_rollout_snapshot(
     domain = np.asarray(system.core.E.embedding.domain, dtype=float)
     grid_size = tuple(int(v) for v in np.asarray(system.core.E.size).ravel())
     heatmap_step_ms = max(cfg.heatmap_frame_ms, 1000.0 / max(1.0, cfg.animation_fps))
+    if progress is not None:
+        progress("building spike heatmap", 78.0)
     heatmaps, heatmap_frame_times_ms = prepare_spike_histograms(
         positions=np.asarray(system.core.E.positions, dtype=float),
         domain=domain,
@@ -2031,14 +2105,20 @@ def build_rollout_snapshot(
         ts=ts_ms,
         window_ms=cfg.heatmap_window_ms,
         frame_step_ms=heatmap_step_ms,
+        progress=make_subprogress(progress, "building spike heatmap", 78.0, 94.0),
     )
 
+    if progress is not None:
+        progress("extracting spike raster", 96.0)
     raster_t_ms, raster_neuron_idx = prepare_raster_points(
         spikes, ts_ms, cfg.raster_neurons
     )
 
     forward_end = float(pos[-1, 0]) if pos.size else 0.0
     height_end = float(pos[-1, 1]) if pos.size else 0.0
+
+    if progress is not None:
+        progress("finalizing snapshot", 100.0)
 
     return RolloutSnapshot(
         epoch=epoch,
