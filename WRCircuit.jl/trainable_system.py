@@ -262,6 +262,20 @@ def _queue_put_latest(message_queue, message):
         pass
 
 
+def _log(message: str):
+    print(f"[trainable_system] {message}", flush=True)
+
+
+def _metrics_summary(metrics: Dict[str, float]) -> str:
+    fields = []
+    for key in ("loss", "reward", "distance", "mean_vx", "height_error", "pitch_error"):
+        if key in metrics:
+            fields.append(f"{key}={metrics[key]:.4f}")
+    if "grad_norm" in metrics:
+        fields.append(f"grad_norm={metrics['grad_norm']:.4f}")
+    return " ".join(fields)
+
+
 class TerminalProgressBar:
     def __init__(self, total: int, label: str, width: int = 28):
         self.total = max(1, int(total))
@@ -690,38 +704,55 @@ class TrainableWalkingSystem:
         }
         return loss, metrics
 
-    def train_step(self, features: Optional[np.ndarray] = None) -> Dict[str, float]:
+    def train_step(
+        self,
+        features: Optional[np.ndarray] = None,
+        progress_prefix: Optional[str] = None,
+    ) -> Dict[str, float]:
         features = self._coerce_features(features)
         sigma = float(self.cfg.es_noise_std)
         population = max(1, int(self.cfg.es_population))
         grad_accum = jax.tree_util.tree_map(lambda p: np.zeros_like(p, dtype=np.float32), self.params)
+        step_prefix = progress_prefix or "optimizer step"
 
-        for _ in range(population):
+        _log(f"{step_prefix}: estimating gradient with {population} perturbation pairs")
+
+        for sample_idx in range(population):
+            sample_tag = f"{step_prefix} pair {sample_idx + 1}/{population}"
             noise = jax.tree_util.tree_map(
                 lambda p: self.rng.standard_normal(p.shape).astype(np.float32),
                 self.params,
             )
             params_plus = jax.tree_util.tree_map(lambda p, n: p + sigma * n, self.params, noise)
             params_minus = jax.tree_util.tree_map(lambda p, n: p - sigma * n, self.params, noise)
-            reward_plus = self._metrics_from_rollout(self._simulate(params_plus, features), features)[1]["reward"]
-            reward_minus = self._metrics_from_rollout(self._simulate(params_minus, features), features)[1]["reward"]
+            rollout_plus = self._simulate(params_plus, features, progress_label=f"{sample_tag} (+)")
+            reward_plus = self._metrics_from_rollout(rollout_plus, features)[1]["reward"]
+            rollout_minus = self._simulate(params_minus, features, progress_label=f"{sample_tag} (-)")
+            reward_minus = self._metrics_from_rollout(rollout_minus, features)[1]["reward"]
             coeff = self.cfg.es_reward_scale * (reward_plus - reward_minus) / (2.0 * sigma * population)
             grad_accum = jax.tree_util.tree_map(
                 lambda g, n: g + coeff * n,
                 grad_accum,
                 noise,
             )
+            _log(
+                f"{sample_tag}: reward_plus={reward_plus:.4f} "
+                f"reward_minus={reward_minus:.4f} coeff={coeff:.4f}"
+            )
 
         grad_norm = float(_tree_global_norm(grad_accum))
         if grad_norm > self.cfg.gradient_clip > 0.0:
             scale = self.cfg.gradient_clip / (grad_norm + 1e-8)
             grad_accum = jax.tree_util.tree_map(lambda g: g * scale, grad_accum)
+            _log(f"{step_prefix}: clipped gradient to norm {self.cfg.gradient_clip:.4f}")
 
+        _log(f"{step_prefix}: applying Adam update")
         self.params = self._adam_update(self.params, grad_accum)
-        rollout = self._simulate(self.params, features)
+        rollout = self._simulate(self.params, features, progress_label=f"{step_prefix} eval")
         loss, metrics = self._metrics_from_rollout(rollout, features)
         metrics["loss"] = float(loss)
         metrics["grad_norm"] = grad_norm
+        _log(f"{step_prefix}: complete {_metrics_summary(metrics)}")
         return metrics
 
     def evaluate(self, features: Optional[np.ndarray] = None):
@@ -790,8 +821,14 @@ def prepare_spike_histograms_for_times(
 
 def _training_worker(cfg: Config, features: np.ndarray, message_queue, stop_event):
     try:
+        _log("backend worker booting")
         system = TrainableWalkingSystem(cfg)
         refresh_every = cfg.vis_every if cfg.vis_every > 0 else cfg.eval_every
+        epoch_progress = TerminalProgressBar(max(1, cfg.train_epochs), "training epochs")
+        _log(
+            f"backend ready: epochs={cfg.train_epochs} refresh_every={refresh_every} "
+            f"es_population={cfg.es_population}"
+        )
 
         _queue_put_latest(
             message_queue,
@@ -801,10 +838,12 @@ def _training_worker(cfg: Config, features: np.ndarray, message_queue, stop_even
                 "detail": "running initial rollout",
             },
         )
+        _log("starting initial rollout for viewer bootstrap")
         rollout, metrics = system.evaluate_with_progress(
             features,
             progress_label="initial rollout",
         )
+        _log(f"initial rollout complete {_metrics_summary(metrics)}")
         _queue_put_latest(
             message_queue,
             {
@@ -827,8 +866,14 @@ def _training_worker(cfg: Config, features: np.ndarray, message_queue, stop_even
                     "detail": "running optimizer step",
                 },
             )
-            latest_metrics = system.train_step(features)
+            _log(f"epoch {epoch + 1}/{cfg.train_epochs}: starting optimizer step")
+            latest_metrics = system.train_step(
+                features,
+                progress_prefix=f"epoch {epoch + 1}/{cfg.train_epochs}",
+            )
             epoch += 1
+            epoch_progress.update(epoch)
+            _log(f"epoch {epoch}/{cfg.train_epochs}: optimizer step complete {_metrics_summary(latest_metrics)}")
 
             _queue_put_latest(
                 message_queue,
@@ -843,6 +888,7 @@ def _training_worker(cfg: Config, features: np.ndarray, message_queue, stop_even
 
             should_refresh = epoch == 1 or epoch % max(1, refresh_every) == 0 or epoch >= cfg.train_epochs
             if should_refresh and not stop_event.is_set():
+                _log(f"epoch {epoch}/{cfg.train_epochs}: refreshing viewer rollout")
                 _queue_put_latest(
                     message_queue,
                     {
@@ -855,6 +901,7 @@ def _training_worker(cfg: Config, features: np.ndarray, message_queue, stop_even
                     features,
                     progress_label="refresh rollout",
                 )
+                _log(f"epoch {epoch}/{cfg.train_epochs}: refresh rollout complete {_metrics_summary(eval_metrics)}")
                 _queue_put_latest(
                     message_queue,
                     {
@@ -867,6 +914,8 @@ def _training_worker(cfg: Config, features: np.ndarray, message_queue, stop_even
                     },
                 )
 
+        epoch_progress.finish()
+        _log(f"training worker finished at epoch {epoch}/{cfg.train_epochs}")
         _queue_put_latest(
             message_queue,
             {
@@ -877,6 +926,7 @@ def _training_worker(cfg: Config, features: np.ndarray, message_queue, stop_even
             },
         )
     except Exception as exc:  # pragma: no cover - worker-side runtime path.
+        _log(f"backend worker failed: {exc}")
         _queue_put_latest(
             message_queue,
             {
@@ -924,6 +974,11 @@ class TrainingViewer:
         self.start_time = time.perf_counter()
         self.last_log_time = self.start_time
         self.worker_done = False
+        self.robot_y_limits = (0.0, 1.0)
+        self.camera_half_width = max(
+            0.5,
+            self.cfg.body_length + self.cfg.thigh_length + self.cfg.shank_length + 0.2,
+        )
 
         self.fig = plt.figure(figsize=(14, 8))
         gs = self.fig.add_gridspec(2, 2, width_ratios=[1.15, 1.0], hspace=0.30, wspace=0.28)
@@ -967,7 +1022,7 @@ class TrainingViewer:
             origin="lower",
             extent=[0.0, self.cfg.controller_dx_mm, 0.0, self.cfg.controller_dx_mm],
             interpolation="nearest",
-            aspect="auto",
+            aspect="equal",
             cmap="hot",
             vmin=0.0,
             vmax=1.0,
@@ -975,6 +1030,8 @@ class TrainingViewer:
         self.fig.colorbar(self.net_im, ax=self.ax_net, fraction=0.046, pad=0.04).set_label(
             "Spike Count"
         )
+        self.ax_net.set_aspect("equal", adjustable="box")
+        self.ax_net.set_box_aspect(1.0)
         self.ax_net.set_title("Spatial Spiking Controller")
         self.ax_net.set_xlabel("x (mm)")
         self.ax_net.set_ylabel("y (mm)")
@@ -1012,19 +1069,9 @@ class TrainingViewer:
         self.ax_status.set_xlim(0.0, 1.0)
         self.ax_status.set_ylim(0.0, 1.0)
         self.ax_status.axis("off")
-        self.ax_status.text(0.0, 0.63, "Training", va="center", ha="left", fontsize=9)
-        self.ax_status.text(0.0, 0.44, "Playback", va="center", ha="left", fontsize=9)
-        self.ax_status.text(0.0, 0.25, "Phase", va="center", ha="left", fontsize=9)
-        self.train_bar_bg = plt.Rectangle((0.18, 0.58), 0.74, 0.08, color="0.9")
-        self.train_bar_fg = plt.Rectangle((0.18, 0.58), 0.0, 0.08, color="tab:blue")
-        self.play_bar_bg = plt.Rectangle((0.18, 0.39), 0.74, 0.08, color="0.9")
-        self.play_bar_fg = plt.Rectangle((0.18, 0.39), 0.0, 0.08, color="tab:orange")
-        self.ax_status.add_patch(self.train_bar_bg)
-        self.ax_status.add_patch(self.train_bar_fg)
-        self.ax_status.add_patch(self.play_bar_bg)
-        self.ax_status.add_patch(self.play_bar_fg)
+        self.ax_status.text(0.0, 0.98, "Status", va="top", ha="left", fontsize=10, fontweight="bold")
         self.phase_text = self.ax_status.text(
-            0.18, 0.25, "", va="center", ha="left", family="monospace", fontsize=9
+            0.0, 0.86, "", va="top", ha="left", family="monospace", fontsize=9
         )
 
     def _set_phase(self, phase: str, detail: str):
@@ -1116,6 +1163,7 @@ class TrainingViewer:
         self.frame_ptr = 0
 
         runner = RolloutRunner(mon=rollout)
+        _log(f"viewer: preparing spike maps for {len(self.frame_times)} frames")
         self.histograms, _ = prepare_spike_histograms_for_times(
             self.system,
             runner,
@@ -1123,13 +1171,12 @@ class TrainingViewer:
             self.cfg.window_size_ms,
             progress_label="preparing spike maps",
         )
+        _log("viewer: spike maps ready")
         vmax = max(1.0, float(np.max(self.histograms)))
         self.net_im.set_clim(0.0, vmax)
 
         pos = np.asarray(rollout["pos"], dtype=float)
         foot_pos = np.asarray(rollout["foot_pos"], dtype=float)
-        min_x = float(min(np.min(pos[:, 0]) - self.cfg.body_length, np.min(foot_pos[:, :, 0]) - 0.1))
-        max_x = float(max(np.max(pos[:, 0]) + self.cfg.body_length, np.max(foot_pos[:, :, 0]) + 0.1))
         min_y = float(
             min(
                 np.min(pos[:, 1]) - self.cfg.body_height,
@@ -1144,8 +1191,12 @@ class TrainingViewer:
                 self.cfg.height_target + 0.08,
             )
         )
-        self.ax_robot.set_xlim(min_x, max_x)
-        self.ax_robot.set_ylim(min_y, max_y)
+        self.robot_y_limits = (min_y, max_y)
+        self.camera_half_width = max(
+            0.5,
+            self.cfg.body_length + self.cfg.thigh_length + self.cfg.shank_length + 0.2,
+        )
+        self.ax_robot.set_ylim(*self.robot_y_limits)
         self.force_scale = 0.35 * self.cfg.body_length / max(
             1.0, float(np.max(np.linalg.norm(np.asarray(rollout["force"], dtype=float), axis=1)))
         )
@@ -1213,6 +1264,7 @@ class TrainingViewer:
             [p[0], p[0] + f[0] * self.force_scale],
             [p[1], p[1] + f[1] * self.force_scale],
         )
+        self.ax_robot.set_xlim(p[0] - self.camera_half_width, p[0] + self.camera_half_width)
         self.ax_robot.set_title(
             "Walker Rollout | "
             f"epoch={self.epoch} | x={p[0]:.3f} y={p[1]:.3f} pitch={theta:.3f}"
@@ -1220,15 +1272,9 @@ class TrainingViewer:
 
     def _refresh_status(self):
         elapsed = time.perf_counter() - self.start_time
-        train_progress = 0.0 if self.cfg.train_epochs <= 0 else min(
-            1.0, self.epoch / float(self.cfg.train_epochs)
-        )
-        play_progress = 0.0 if len(self.frame_indices) <= 1 else self.frame_ptr / float(
-            len(self.frame_indices) - 1
-        )
-        self.train_bar_fg.set_width(0.74 * train_progress)
-        self.play_bar_fg.set_width(0.74 * play_progress)
         self.phase_text.set_text(f"{self.current_phase:<10} {self.phase_detail}")
+        playback_frame = 0 if len(self.frame_indices) <= 1 else self.frame_ptr + 1
+        playback_total = max(1, len(self.frame_indices))
         metric_lines = (
             [
                 f"loss           : {self.history_loss[-1]: .4f}" if self.history_loss else "loss           : n/a",
@@ -1253,8 +1299,7 @@ class TrainingViewer:
                 [
                     f"epoch          : {self.epoch:4d} / {self.cfg.train_epochs}",
                     *metric_lines,
-                    f"train progress : {100.0 * train_progress:6.2f} %",
-                    f"playback       : {100.0 * play_progress:6.2f} %",
+                    f"playback frame : {playback_frame:4d} / {playback_total}",
                     f"tick count     : {self.train_tick_count:6d}",
                     f"elapsed        : {elapsed:6.1f} s",
                 ]
