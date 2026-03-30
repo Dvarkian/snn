@@ -18,7 +18,6 @@ from trainable_system import (
     _queue_put_latest,
     _require_runtime as _require_base_runtime,
     _tree_global_norm,
-    _tree_to_numpy,
     build_feature_sequence,
     jax,
     jnp,
@@ -52,34 +51,14 @@ def _require_runtime():
         )
 
 
-def _compatible_spatial_connectivity(cfg: Config) -> dict[str, int]:
-    exc_side = max(1, int(round(np.sqrt(cfg.rho * cfg.controller_dx_mm**2))))
-    n_exc = exc_side * exc_side
-    n_inh = max(1, int(round(n_exc / cfg.gamma)))
-
-    requested = {
-        "K_ee": 260,
-        "K_ei": 340,
-        "K_ie": 225,
-        "K_ii": 290,
-    }
-
-    # Spatial.build_csr() ultimately samples exactly:
-    #   E2E: K_ee * n_exc   from n_exc * n_exc possible edges
-    #   E2I: K_ei * n_inh   from n_exc * n_inh
-    #   I2E: K_ie * n_exc   from n_inh * n_exc
-    #   I2I: K_ii * n_inh   from n_inh * n_inh
-    # so these are the true safe maxima for the compact controller size.
-    limits = {
-        "K_ee": max(1, n_exc),
-        "K_ei": max(1, n_exc),
-        "K_ie": max(1, n_inh),
-        "K_ii": max(1, n_inh),
-    }
-    return {name: int(min(requested[name], limits[name])) for name in requested}
+_RUN_SIMULATION_SPATIAL_SEED = 42
+_RUN_SIMULATION_SPATIAL_RHO = 10000
+_RUN_SIMULATION_SPATIAL_DX_MM = 1.0
 
 
 class TrainableSpatialWalkingSystem(_BaseTrainableWalkingSystem):
+    _TRAINABLE_RECURRENT_KEYS = ("w_ee_raw", "w_ei_raw", "w_ie_raw", "w_ii_raw")
+
     def _init_params(self, key):
         k1, k2 = jax.random.split(key, 2)
         scale_in = 1.0 / np.sqrt(max(1, self.obs_size))
@@ -89,6 +68,10 @@ class TrainableSpatialWalkingSystem(_BaseTrainableWalkingSystem):
             "bias_in": jnp.zeros((self.n_total,), dtype=jnp.float32),
             "w_out": jax.random.normal(k2, (self.n_total, self.action_size)) * scale_out,
             "bias_out": jnp.zeros((self.action_size,), dtype=jnp.float32),
+            "w_ee_raw": jnp.zeros((1,), dtype=jnp.float32),
+            "w_ei_raw": jnp.zeros((1,), dtype=jnp.float32),
+            "w_ie_raw": jnp.zeros((1,), dtype=jnp.float32),
+            "w_ii_raw": jnp.zeros((1,), dtype=jnp.float32),
         }
 
     def __init__(self, cfg: Config):
@@ -98,15 +81,21 @@ class TrainableSpatialWalkingSystem(_BaseTrainableWalkingSystem):
 
         bm.set_dt(cfg.dt_ms)
 
-        spatial_key = jax.random.PRNGKey(cfg.random_seed)
-        self.spatial_connectivity = _compatible_spatial_connectivity(cfg)
+        spatial_key = jax.random.PRNGKey(_RUN_SIMULATION_SPATIAL_SEED)
         self.spatial_model = Spatial(
             key=spatial_key,
-            rho=cfg.rho,
-            dx=cfg.controller_dx_mm,
-            gamma=cfg.gamma,
-            **self.spatial_connectivity,
+            rho=_RUN_SIMULATION_SPATIAL_RHO,
+            dx=_RUN_SIMULATION_SPATIAL_DX_MM,
         )
+        self.spatial_connectivity = {
+            "K_ee": int(self.spatial_model.K_ee),
+            "K_ei": int(self.spatial_model.K_ei),
+            "K_ie": int(self.spatial_model.K_ie),
+            "K_ii": int(self.spatial_model.K_ii),
+        }
+        self.cfg.rho = _RUN_SIMULATION_SPATIAL_RHO
+        self.cfg.controller_dx_mm = _RUN_SIMULATION_SPATIAL_DX_MM
+        self.cfg.gamma = float(self.spatial_model.gamma)
 
         self.exc_side = int(np.asarray(self.spatial_model.E.size, dtype=int)[0])
         self.n_exc = int(np.prod(np.asarray(self.spatial_model.E.size, dtype=int)))
@@ -126,7 +115,10 @@ class TrainableSpatialWalkingSystem(_BaseTrainableWalkingSystem):
             [np.ones((self.n_exc,), dtype=np.float32), np.zeros((self.n_inh,), dtype=np.float32)],
             axis=0,
         )
-        self.fixed_recurrent_weights = self._build_recurrent_weight_matrix()
+        self.recurrent_specs = self._build_recurrent_specs()
+        self.params = self._init_spatial_params(cfg.random_seed)
+        self.opt_state = self._adam_init(self._trainable_params(self.params))
+        self._apply_recurrent_params(self.params)
 
         if self.params["w_in"].shape[1] != self.n_total:
             raise ValueError(
@@ -139,6 +131,49 @@ class TrainableSpatialWalkingSystem(_BaseTrainableWalkingSystem):
         if hasattr(value, "value"):
             value = value.value
         return np.asarray(value, dtype=np.float32).reshape(-1)
+
+    @staticmethod
+    def _softplus(value) -> np.ndarray:
+        return np.logaddexp(np.asarray(value, dtype=np.float32), 0.0).astype(np.float32)
+
+    @staticmethod
+    def _inverse_softplus(value) -> np.ndarray:
+        value = np.maximum(np.asarray(value, dtype=np.float32), 1e-6)
+        large = value > 20.0
+        raw = np.empty_like(value, dtype=np.float32)
+        raw[large] = value[large]
+        raw[~large] = np.log(np.expm1(value[~large])).astype(np.float32)
+        return raw
+
+    @staticmethod
+    def _row_sparse_matrix(
+        rng: np.random.Generator,
+        num_rows: int,
+        num_cols: int,
+        density: float,
+        scale: float,
+    ) -> np.ndarray:
+        count = min(num_cols, max(1, int(round(float(np.clip(density, 0.0, 1.0)) * num_cols))))
+        weights = np.zeros((num_rows, num_cols), dtype=np.float32)
+        for row_idx in range(num_rows):
+            cols = rng.choice(num_cols, size=count, replace=False)
+            weights[row_idx, cols] = scale * rng.standard_normal(count).astype(np.float32)
+        return weights
+
+    @staticmethod
+    def _column_sparse_matrix(
+        rng: np.random.Generator,
+        num_rows: int,
+        num_cols: int,
+        density: float,
+        scale: float,
+    ) -> np.ndarray:
+        count = min(num_rows, max(1, int(round(float(np.clip(density, 0.0, 1.0)) * num_rows))))
+        weights = np.zeros((num_rows, num_cols), dtype=np.float32)
+        for col_idx in range(num_cols):
+            rows = rng.choice(num_rows, size=count, replace=False)
+            weights[rows, col_idx] = scale * rng.standard_normal(count).astype(np.float32)
+        return weights
 
     @staticmethod
     def _assign_input_var(input_var, value):
@@ -167,46 +202,103 @@ class TrainableSpatialWalkingSystem(_BaseTrainableWalkingSystem):
             dense[pre_idx, idx[start:stop]] = w[start:stop]
         return dense
 
-    def _projection_matrix(self, proj, num_pre: int, num_post: int, sign: float = 1.0) -> np.ndarray:
-        return sign * self._csr_to_dense(
-            proj.proj.comm.indices,
-            proj.proj.comm.indptr,
-            proj.proj.comm.weight,
-            num_pre=num_pre,
-            num_post=num_post,
+    def _recurrent_spec(self, proj, num_pre: int, num_post: int, sign: float) -> dict[str, object]:
+        return {
+            "proj": proj,
+            "indices": np.asarray(proj.proj.comm.indices, dtype=int),
+            "indptr": np.asarray(proj.proj.comm.indptr, dtype=int),
+            "weights": np.asarray(proj.proj.comm.weight, dtype=np.float32).reshape(-1),
+            "num_pre": int(num_pre),
+            "num_post": int(num_post),
+            "sign": float(sign),
+        }
+
+    def _build_recurrent_specs(self) -> dict[str, dict[str, object]]:
+        return {
+            "w_ee_raw": self._recurrent_spec(
+                self.spatial_model.E2E,
+                num_pre=self.n_exc,
+                num_post=self.n_exc,
+                sign=1.0,
+            ),
+            "w_ei_raw": self._recurrent_spec(
+                self.spatial_model.E2I,
+                num_pre=self.n_exc,
+                num_post=self.n_inh,
+                sign=1.0,
+            ),
+            "w_ie_raw": self._recurrent_spec(
+                self.spatial_model.I2E,
+                num_pre=self.n_inh,
+                num_post=self.n_exc,
+                sign=-1.0,
+            ),
+            "w_ii_raw": self._recurrent_spec(
+                self.spatial_model.I2I,
+                num_pre=self.n_inh,
+                num_post=self.n_inh,
+                sign=-1.0,
+            ),
+        }
+
+    def _init_spatial_params(self, seed: int) -> dict[str, np.ndarray]:
+        rng = np.random.default_rng(seed + 101)
+        density = float(np.clip(self.cfg.conn_sparsity, 0.0, 1.0))
+        scale_in = 1.0 / np.sqrt(max(1, self.obs_size))
+        scale_out = 1.0 / np.sqrt(max(1, self.n_total))
+        params = {
+            "w_in": self._row_sparse_matrix(
+                rng,
+                num_rows=self.obs_size,
+                num_cols=self.n_total,
+                density=density,
+                scale=scale_in,
+            ),
+            "bias_in": np.zeros((self.n_total,), dtype=np.float32),
+            "w_out": self._column_sparse_matrix(
+                rng,
+                num_rows=self.n_total,
+                num_cols=self.action_size,
+                density=density,
+                scale=scale_out,
+            ),
+            "bias_out": np.zeros((self.action_size,), dtype=np.float32),
+        }
+        for key, spec in self.recurrent_specs.items():
+            params[key] = self._inverse_softplus(spec["weights"])
+        return params
+
+    def _trainable_params(self, params) -> dict[str, np.ndarray]:
+        return {key: np.asarray(params[key], dtype=np.float32) for key in self._TRAINABLE_RECURRENT_KEYS}
+
+    def _merge_trainable_params(self, base_params, trainable_params) -> dict[str, np.ndarray]:
+        merged = {key: np.asarray(value, dtype=np.float32) for key, value in base_params.items()}
+        for key, value in trainable_params.items():
+            merged[key] = np.asarray(value, dtype=np.float32)
+        return merged
+
+    def _dense_projection_from_params(self, params, key: str) -> np.ndarray:
+        spec = self.recurrent_specs[key]
+        weights = self._softplus(params[key])
+        return spec["sign"] * self._csr_to_dense(
+            spec["indices"],
+            spec["indptr"],
+            weights,
+            num_pre=spec["num_pre"],
+            num_post=spec["num_post"],
         )
 
-    def _build_recurrent_weight_matrix(self) -> np.ndarray:
-        weights = np.zeros((self.n_total, self.n_total), dtype=np.float32)
-        weights[: self.n_exc, : self.n_exc] = self._projection_matrix(
-            self.spatial_model.E2E,
-            num_pre=self.n_exc,
-            num_post=self.n_exc,
-            sign=1.0,
-        )
-        weights[: self.n_exc, self.n_exc :] = self._projection_matrix(
-            self.spatial_model.E2I,
-            num_pre=self.n_exc,
-            num_post=self.n_inh,
-            sign=1.0,
-        )
-        weights[self.n_exc :, : self.n_exc] = self._projection_matrix(
-            self.spatial_model.I2E,
-            num_pre=self.n_inh,
-            num_post=self.n_exc,
-            sign=-1.0,
-        )
-        weights[self.n_exc :, self.n_exc :] = self._projection_matrix(
-            self.spatial_model.I2I,
-            num_pre=self.n_inh,
-            num_post=self.n_inh,
-            sign=-1.0,
-        )
-        return weights
+    def _apply_recurrent_params(self, params):
+        for key, spec in self.recurrent_specs.items():
+            spec["proj"].proj.comm.weight = bm.asarray(self._softplus(params[key]))
 
     def _effective_recurrent_weights(self, params):
-        del params
-        return self.fixed_recurrent_weights
+        weights = np.zeros((self.n_total, self.n_total), dtype=np.float32)
+        weights[: self.n_exc, : self.n_exc] = self._dense_projection_from_params(params, "w_ee_raw")
+        weights[: self.n_exc, self.n_exc :] = self._dense_projection_from_params(params, "w_ei_raw")
+        weights[self.n_exc :, : self.n_exc] = self._dense_projection_from_params(params, "w_ie_raw")
+        weights[self.n_exc :, self.n_exc :] = self._dense_projection_from_params(params, "w_ii_raw")
+        return weights
 
     def _spatial_snapshot(self, filt: np.ndarray, step: int) -> dict[str, np.ndarray]:
         spike = np.concatenate(
@@ -251,6 +343,10 @@ class TrainableSpatialWalkingSystem(_BaseTrainableWalkingSystem):
         filt = np.zeros((self.n_total,), dtype=np.float32)
         return self._spatial_snapshot(filt=filt, step=0)
 
+    def _simulate(self, params, features, progress_label: Optional[str] = None):
+        self._apply_recurrent_params(params)
+        return super()._simulate(params, features, progress_label=progress_label)
+
     def _controller_step(self, params, ctrl_state, obs):
         obs = np.asarray(obs, dtype=np.float32)
         drive = self.cfg.input_gain * (obs @ params["w_in"]) + params["bias_in"]
@@ -273,6 +369,72 @@ class TrainableSpatialWalkingSystem(_BaseTrainableWalkingSystem):
 
         next_state = self._spatial_snapshot(filt=filt, step=int(ctrl_state["step"]) + 1)
         return next_state, action.astype(np.float32)
+
+    def train_step(
+        self,
+        features: Optional[np.ndarray] = None,
+        progress_prefix: Optional[str] = None,
+    ) -> dict[str, float]:
+        features = self._coerce_features(features)
+        sigma = float(self.cfg.es_noise_std)
+        population = max(1, int(self.cfg.es_population))
+        trainable_params = self._trainable_params(self.params)
+        grad_accum = jax.tree_util.tree_map(
+            lambda p: np.zeros_like(p, dtype=np.float32),
+            trainable_params,
+        )
+        step_prefix = progress_prefix or "optimizer step"
+
+        _log(f"{step_prefix}: estimating recurrent-only gradient with {population} perturbation pairs")
+
+        for sample_idx in range(population):
+            sample_tag = f"{step_prefix} pair {sample_idx + 1}/{population}"
+            noise = jax.tree_util.tree_map(
+                lambda p: self.rng.standard_normal(p.shape).astype(np.float32),
+                trainable_params,
+            )
+            trainable_plus = jax.tree_util.tree_map(
+                lambda p, n: p + sigma * n,
+                trainable_params,
+                noise,
+            )
+            trainable_minus = jax.tree_util.tree_map(
+                lambda p, n: p - sigma * n,
+                trainable_params,
+                noise,
+            )
+            params_plus = self._merge_trainable_params(self.params, trainable_plus)
+            params_minus = self._merge_trainable_params(self.params, trainable_minus)
+            rollout_plus = self._simulate(params_plus, features, progress_label=f"{sample_tag} (+)")
+            reward_plus = self._metrics_from_rollout(rollout_plus, features)[1]["reward"]
+            rollout_minus = self._simulate(params_minus, features, progress_label=f"{sample_tag} (-)")
+            reward_minus = self._metrics_from_rollout(rollout_minus, features)[1]["reward"]
+            coeff = self.cfg.es_reward_scale * (reward_plus - reward_minus) / (2.0 * sigma * population)
+            grad_accum = jax.tree_util.tree_map(
+                lambda g, n: g + coeff * n,
+                grad_accum,
+                noise,
+            )
+            _log(
+                f"{sample_tag}: reward_plus={reward_plus:.4f} "
+                f"reward_minus={reward_minus:.4f} coeff={coeff:.4f}"
+            )
+
+        grad_norm = float(_tree_global_norm(grad_accum))
+        if grad_norm > self.cfg.gradient_clip > 0.0:
+            scale = self.cfg.gradient_clip / (grad_norm + 1e-8)
+            grad_accum = jax.tree_util.tree_map(lambda g: g * scale, grad_accum)
+            _log(f"{step_prefix}: clipped recurrent gradient to norm {self.cfg.gradient_clip:.4f}")
+
+        _log(f"{step_prefix}: applying Adam update to recurrent weights")
+        updated_trainable = self._adam_update(trainable_params, grad_accum)
+        self.params = self._merge_trainable_params(self.params, updated_trainable)
+        rollout = self._simulate(self.params, features, progress_label=f"{step_prefix} eval")
+        loss, metrics = self._metrics_from_rollout(rollout, features)
+        metrics["loss"] = float(loss)
+        metrics["grad_norm"] = grad_norm
+        _log(f"{step_prefix}: complete {_metrics_summary(metrics)}")
+        return metrics
 
 
 TrainableWalkingSystem = TrainableSpatialWalkingSystem
