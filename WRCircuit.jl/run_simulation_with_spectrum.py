@@ -5,7 +5,6 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import Circle
 from matplotlib.widgets import Button, Slider
-from scipy.signal import welch
 
 from run_simulation import (
     DURATION_MS,
@@ -21,13 +20,16 @@ from run_simulation import (
 from src.models.Spatial import Spatial
 
 
+SIMULATION_DURATION_MS = DURATION_MS * 2.0
+
 PATCH_CENTER_FRACTION = (0.5, 0.5)
 PATCH_RADIUS_FRACTION = 0.12
 
 SPECTRUM_MIN_DURATION_MS = 250.0
 SPECTRUM_MAX_HZ = 120.0
-SPECTRUM_SEGMENT_MS = 512.0
-SPECTRUM_OVERLAP = 0.5
+SPECTRUM_SEGMENT_MS = 1024.0
+SPECTRUM_OVERLAP = 0.75
+PATCH_RATE_SMOOTHING_MS = 4.0
 
 THETA_BAND_HZ = (4.0, 12.0)
 GAMMA_BAND_HZ = (30.0, 100.0)
@@ -75,6 +77,25 @@ def prepare_patch_rate_series(runner, patch_mask, frame_times, frame_step_ms):
     return patch_rate_hz, patch_neuron_count
 
 
+def build_gaussian_kernel(std_frames, truncate=4.0):
+    if std_frames <= 0.0:
+        return np.array([1.0], dtype=float)
+
+    radius = max(1, int(np.ceil(truncate * std_frames)))
+    offsets = np.arange(-radius, radius + 1, dtype=float)
+    kernel = np.exp(-0.5 * (offsets / std_frames) ** 2)
+    kernel /= np.sum(kernel)
+    return kernel
+
+
+def smooth_patch_rate_series(patch_rate_hz, frame_step_ms):
+    std_frames = PATCH_RATE_SMOOTHING_MS / frame_step_ms
+    kernel = build_gaussian_kernel(std_frames)
+    pad_width = len(kernel) // 2
+    padded = np.pad(np.asarray(patch_rate_hz, dtype=float), pad_width=pad_width, mode="edge")
+    return np.convolve(padded, kernel, mode="valid")
+
+
 def extract_band_peak(freqs_hz, power, band_hz):
     band_mask = (freqs_hz >= band_hz[0]) & (freqs_hz <= band_hz[1]) & np.isfinite(power)
     if not np.any(band_mask):
@@ -90,41 +111,79 @@ def next_power_of_two(value):
     return 1 << (value - 1).bit_length()
 
 
+def welch_psd(signal, sample_rate_hz, nperseg, noverlap, nfft):
+    signal = np.asarray(signal, dtype=float)
+    n_samples = len(signal)
+    if n_samples == 0:
+        freqs_hz = np.fft.rfftfreq(nfft, d=1.0 / sample_rate_hz)
+        return freqs_hz, np.full_like(freqs_hz, np.nan, dtype=float)
+
+    nperseg = max(8, min(int(nperseg), n_samples))
+    noverlap = min(int(noverlap), max(0, nperseg - 1))
+    step = max(1, nperseg - noverlap)
+
+    if n_samples == nperseg:
+        segment_starts = np.array([0], dtype=int)
+    else:
+        segment_starts = np.arange(0, n_samples - nperseg + 1, step, dtype=int)
+        last_start = n_samples - nperseg
+        if segment_starts.size == 0 or segment_starts[-1] != last_start:
+            segment_starts = np.append(segment_starts, last_start)
+
+    window = np.hanning(nperseg)
+    window_power = np.sum(window**2)
+    segments = np.stack(
+        [signal[start : start + nperseg] for start in segment_starts],
+        axis=0,
+    )
+    segments = segments - np.mean(segments, axis=1, keepdims=True)
+    tapered_segments = segments * window[None, :]
+
+    fft_values = np.fft.rfft(tapered_segments, n=nfft, axis=1)
+    psd_segments = np.abs(fft_values) ** 2 / (sample_rate_hz * window_power)
+
+    if nfft % 2 == 0:
+        psd_segments[:, 1:-1] *= 2.0
+    else:
+        psd_segments[:, 1:] *= 2.0
+
+    freqs_hz = np.fft.rfftfreq(nfft, d=1.0 / sample_rate_hz)
+    return freqs_hz, np.median(psd_segments, axis=0)
+
+
 def prepare_patch_spectra(patch_rate_hz, frame_step_ms):
     sample_rate_hz = 1000.0 / frame_step_ms
     min_samples = max(8, int(np.ceil(SPECTRUM_MIN_DURATION_MS / frame_step_ms)))
     segment_samples = max(64, int(round(SPECTRUM_SEGMENT_MS / frame_step_ms)))
-    nfft = max(256, next_power_of_two(len(patch_rate_hz)))
+    overlap_samples = int(round(segment_samples * SPECTRUM_OVERLAP))
+    processed_rate_hz = smooth_patch_rate_series(patch_rate_hz, frame_step_ms)
+    nfft = max(512, next_power_of_two(len(processed_rate_hz)))
     freqs_hz = np.fft.rfftfreq(nfft, d=1.0 / sample_rate_hz)
 
-    spectra = np.full((len(patch_rate_hz), len(freqs_hz)), np.nan, dtype=float)
-    theta_peak_hz = np.full(len(patch_rate_hz), np.nan, dtype=float)
-    theta_peak_power = np.full(len(patch_rate_hz), np.nan, dtype=float)
-    gamma_peak_hz = np.full(len(patch_rate_hz), np.nan, dtype=float)
-    gamma_peak_power = np.full(len(patch_rate_hz), np.nan, dtype=float)
+    spectra = np.full((len(processed_rate_hz), len(freqs_hz)), np.nan, dtype=float)
+    theta_peak_hz = np.full(len(processed_rate_hz), np.nan, dtype=float)
+    theta_peak_power = np.full(len(processed_rate_hz), np.nan, dtype=float)
+    gamma_peak_hz = np.full(len(processed_rate_hz), np.nan, dtype=float)
+    gamma_peak_power = np.full(len(processed_rate_hz), np.nan, dtype=float)
 
-    for frame_idx in range(len(patch_rate_hz)):
+    for frame_idx in range(len(processed_rate_hz)):
         n_samples = frame_idx + 1
         if n_samples < min_samples:
             continue
 
-        segment = np.asarray(patch_rate_hz[:n_samples], dtype=float)
+        segment = np.asarray(processed_rate_hz[:n_samples], dtype=float)
         if np.allclose(segment, segment[0]):
             spectra[frame_idx] = 0.0
             continue
 
         nperseg = min(segment_samples, n_samples)
-        noverlap = min(int(round(nperseg * SPECTRUM_OVERLAP)), max(0, nperseg - 1))
-        _, power = welch(
+        noverlap = min(overlap_samples, max(0, nperseg - 1))
+        _, power = welch_psd(
             segment,
-            fs=sample_rate_hz,
-            window="hann",
+            sample_rate_hz=sample_rate_hz,
             nperseg=nperseg,
             noverlap=noverlap,
             nfft=nfft,
-            detrend="constant",
-            return_onesided=True,
-            scaling="density",
         )
 
         spectra[frame_idx] = power
@@ -151,8 +210,6 @@ def show_interactive_spiking_and_spectrum(
     domain,
     patch_center_mm,
     patch_radius_mm,
-    patch_rate_hz,
-    patch_neuron_count,
     spectrum_data,
     fps,
     playback_speed,
@@ -262,16 +319,6 @@ def show_interactive_spiking_and_spectrum(
     spectrum_ax.set_ylabel("Power Spectral Density")
     spectrum_ax.legend(loc="upper right")
     spectrum_title = spectrum_ax.set_title("")
-    spectrum_text = spectrum_ax.text(
-        0.02,
-        0.95,
-        "",
-        transform=spectrum_ax.transAxes,
-        ha="left",
-        va="top",
-        fontsize=10,
-        bbox={"boxstyle": "round,pad=0.35", "facecolor": "white", "alpha": 0.9},
-    )
 
     state = {
         "frame_idx": 0,
@@ -327,8 +374,8 @@ def show_interactive_spiking_and_spectrum(
 
     def peak_label(name, peak_hz):
         if np.isfinite(peak_hz):
-            return f"{name}: {peak_hz:.1f} Hz"
-        return f"{name}: warming up"
+            return f"{name} {peak_hz:.1f} Hz"
+        return f"{name} warming up"
 
     def draw_frame(frame_idx, sync_slider=True):
         frame_idx = int(np.clip(frame_idx, 0, num_frames - 1))
@@ -341,7 +388,6 @@ def show_interactive_spiking_and_spectrum(
         )
 
         current_spectrum = spectra[frame_idx, freq_mask]
-        current_rate_hz = float(patch_rate_hz[frame_idx])
 
         if np.any(np.isfinite(current_spectrum)):
             safe_spectrum = np.maximum(current_spectrum, power_floor)
@@ -358,22 +404,20 @@ def show_interactive_spiking_and_spectrum(
                 gamma_peak_hz[frame_idx],
                 gamma_peak_power[frame_idx],
             )
-            spectrum_title.set_text(f"Circular Window PSD | using samples up to {current_time_ms:.1f} ms")
-            spectrum_text.set_text(
-                f"{patch_neuron_count} excitatory neurons in patch\n"
-                f"instantaneous patch rate: {current_rate_hz:.1f} Hz\n"
-                f"{peak_label('theta peak', theta_peak_hz[frame_idx])}\n"
-                f"{peak_label('gamma peak', gamma_peak_hz[frame_idx])}"
+            spectrum_title.set_text(
+                "Circular Window PSD | "
+                f"t = {current_time_ms:.1f} ms | "
+                f"{peak_label('theta', theta_peak_hz[frame_idx])} | "
+                f"{peak_label('gamma', gamma_peak_hz[frame_idx])}"
             )
         else:
             spectrum_line.set_data([], [])
             set_peak_artist(theta_marker, theta_line, np.nan, np.nan)
             set_peak_artist(gamma_marker, gamma_line, np.nan, np.nan)
-            spectrum_title.set_text("Circular Window PSD")
-            spectrum_text.set_text(
-                f"{patch_neuron_count} excitatory neurons in patch\n"
-                f"instantaneous patch rate: {current_rate_hz:.1f} Hz\n"
-                f"accumulating at least {SPECTRUM_MIN_DURATION_MS:.0f} ms of data"
+            spectrum_title.set_text(
+                "Circular Window PSD | "
+                f"t = {current_time_ms:.1f} ms | "
+                f"warming up {SPECTRUM_MIN_DURATION_MS:.0f} ms"
             )
 
         if sync_slider and num_frames > 1:
@@ -438,9 +482,9 @@ def main():
     print("Creating Spatial model...")
     model = Spatial(key=key, rho=RHO, dx=DX)
 
-    print(f"Running simulation for {DURATION_MS} ms...")
+    print(f"Running simulation for {SIMULATION_DURATION_MS} ms...")
     runner = bp.DSRunner(model, monitors=["E.spike", "I.spike"])
-    runner.run(DURATION_MS)
+    runner.run(SIMULATION_DURATION_MS)
     print("Simulation finished.")
 
     print("Preparing spatial spike histograms...")
@@ -453,9 +497,11 @@ def main():
 
     patch_center_mm, patch_radius_mm = resolve_patch_geometry(domain)
     patch_mask = build_patch_mask(model, patch_center_mm, patch_radius_mm)
+    patch_neuron_count = int(np.sum(patch_mask))
+    print(f"Patch contains {patch_neuron_count} excitatory neurons.")
 
     print("Preparing circular-window activity trace...")
-    patch_rate_hz, patch_neuron_count = prepare_patch_rate_series(
+    patch_rate_hz, _ = prepare_patch_rate_series(
         runner,
         patch_mask,
         frame_times,
@@ -475,8 +521,6 @@ def main():
         domain=domain,
         patch_center_mm=patch_center_mm,
         patch_radius_mm=patch_radius_mm,
-        patch_rate_hz=patch_rate_hz,
-        patch_neuron_count=patch_neuron_count,
         spectrum_data=spectrum_data,
         fps=FPS,
         playback_speed=PLAYBACK_SPEED,
