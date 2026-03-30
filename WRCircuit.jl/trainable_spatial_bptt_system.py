@@ -299,9 +299,19 @@ class TrainableSpatialBPTTWalkingSystem(_ESTrainableSpatialWalkingSystem):
         self.spatial_model._mode = training_mode
         self.spatial_model.E._mode = training_mode
         self.spatial_model.I._mode = training_mode
-        self.spatial_model.ext._mode = training_mode
+        self._upgrade_spike_buffer(self.spatial_model.E)
+        self._upgrade_spike_buffer(self.spatial_model.I)
         for proj_name in ("E2E", "E2I", "I2E", "I2I", "ext2E", "ext2I"):
             getattr(self.spatial_model, proj_name)._mode = training_mode
+
+    @staticmethod
+    def _upgrade_spike_buffer(neuron_group):
+        spike_shape = tuple(int(v) for v in np.asarray(neuron_group.spike.value).shape)
+        object.__setattr__(
+            neuron_group,
+            "spike",
+            bm.Variable(bm.zeros(spike_shape, dtype=bm.float_)),
+        )
 
     def _build_bptt_functions(self):
         grad_vars = {key: getattr(self.rollout_model, key) for key in self._TRAINABLE_RECURRENT_KEYS}
