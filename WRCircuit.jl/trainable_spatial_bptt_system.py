@@ -5,6 +5,8 @@ from typing import Optional
 
 import numpy as np
 
+import src.neurons as _src_neurons
+
 from trainable_system import (
     AdamState,
     Config,
@@ -29,6 +31,9 @@ from trainable_spatial_system import (
 
 
 _ensure_writable_runtime_dirs()
+
+if not hasattr(_src_neurons, "stop_gradient"):
+    _src_neurons.stop_gradient = jax.lax.stop_gradient
 
 
 _BPTT_BASE = bp.DynamicalSystem if bp is not None else object
