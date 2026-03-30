@@ -288,11 +288,20 @@ class _DifferentiableSpatialCartPoleRollout(_BPTT_BASE):
 class TrainableSpatialBPTTWalkingSystem(_ESTrainableSpatialWalkingSystem):
     def __init__(self, cfg: Config):
         _require_spatial_runtime()
-        bm.set_mode(bm.training_mode)
         super().__init__(cfg)
+        self._enable_spatial_training_mode()
         self.compute_backend = "cartpole+spatial+bptt"
         self.rollout_model = _DifferentiableSpatialCartPoleRollout(self)
         self._build_bptt_functions()
+
+    def _enable_spatial_training_mode(self):
+        training_mode = bm.TrainingMode() if hasattr(bm, "TrainingMode") else bm.training_mode
+        self.spatial_model._mode = training_mode
+        self.spatial_model.E._mode = training_mode
+        self.spatial_model.I._mode = training_mode
+        self.spatial_model.ext._mode = training_mode
+        for proj_name in ("E2E", "E2I", "I2E", "I2I", "ext2E", "ext2I"):
+            getattr(self.spatial_model, proj_name)._mode = training_mode
 
     def _build_bptt_functions(self):
         grad_vars = {key: getattr(self.rollout_model, key) for key in self._TRAINABLE_RECURRENT_KEYS}
