@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import multiprocessing as mp
 from typing import Optional
 
@@ -53,7 +54,213 @@ def _require_runtime():
 
 _RUN_SIMULATION_SPATIAL_SEED = 42
 _RUN_SIMULATION_SPATIAL_RHO = 10000
-_RUN_SIMULATION_SPATIAL_DX_MM = 1.0
+_RUN_SIMULATION_SPATIAL_DX_MM = 0.5
+
+
+@dataclass(frozen=True)
+class CartPoleObservation:
+    pos: np.ndarray
+    vel: np.ndarray
+    angle: float
+    omega: float
+    last_force: float
+
+
+class CartPolePhysics:
+    def __init__(self, cfg: Config, cart_width: float, cart_height: float, pole_length: float, force_limit: float):
+        self.cfg = cfg
+        self.dt = float(cfg.dt_ms) / 1000.0
+        self.g = float(cfg.gravity)
+        self.cart_mass = float(cfg.mass)
+        self.pole_mass = float(cfg.thigh_mass + cfg.shank_mass)
+        self.total_mass = self.cart_mass + self.pole_mass
+        self.cart_width = float(cart_width)
+        self.cart_height = float(cart_height)
+        self.cart_y = 0.5 * self.cart_height + 0.04
+        self.pole_length = float(max(1e-3, pole_length))
+        self.pole_com_length = 0.5 * self.pole_length
+        self.polemass_length = self.pole_mass * self.pole_com_length
+        self.force_limit = float(force_limit)
+        self.track_half_width = float(max(1.5, 6.0 * self.cart_width))
+        self.linear_damping = float(getattr(cfg, "drag", 0.0))
+        self.angular_damping = 0.1 * float(getattr(cfg, "angular_drag", 0.0))
+
+        self.x = 0.0
+        self.x_dot = 0.0
+        self.theta = float(cfg.initial_pitch)
+        self.theta_dot = 0.0
+        self.last_force = 0.0
+        self.last_joint_torque = np.zeros((cfg.n_legs, 2), dtype=np.float32)
+
+    def observe(self) -> CartPoleObservation:
+        return CartPoleObservation(
+            pos=np.asarray([self.x, self.cart_y], dtype=np.float32),
+            vel=np.asarray([self.x_dot, 0.0], dtype=np.float32),
+            angle=float(self.theta),
+            omega=float(self.theta_dot),
+            last_force=float(self.last_force),
+        )
+
+    def step(self, force_cmd: float):
+        force = float(np.clip(force_cmd, -self.force_limit, self.force_limit))
+        self.last_force = force
+
+        sin_theta = float(np.sin(self.theta))
+        cos_theta = float(np.cos(self.theta))
+        temp = (
+            force
+            + self.polemass_length * self.theta_dot * self.theta_dot * sin_theta
+            - self.linear_damping * self.x_dot
+        ) / self.total_mass
+        denom = self.pole_com_length * (
+            4.0 / 3.0 - (self.pole_mass * cos_theta * cos_theta) / self.total_mass
+        )
+        theta_acc = (
+            self.g * sin_theta
+            - cos_theta * temp
+            - self.angular_damping * self.theta_dot
+        ) / max(1e-6, denom)
+        x_acc = temp - (self.polemass_length * theta_acc * cos_theta) / self.total_mass
+
+        self.x_dot += self.dt * x_acc
+        self.theta_dot += self.dt * theta_acc
+        self.x += self.dt * self.x_dot
+        self.theta += self.dt * self.theta_dot
+
+        if abs(self.x) > self.track_half_width:
+            self.x = float(np.clip(self.x, -self.track_half_width, self.track_half_width))
+            self.x_dot *= -0.15
+
+
+class CartPoleTrainingViewer(TrainingViewer):
+    def _init_robot_panel(self):
+        self.ax_robot.set_aspect("equal", adjustable="box")
+        self.ax_robot.set_xlabel("x")
+        self.ax_robot.set_ylabel("y")
+        self.ax_robot.axhline(self.system.cart_track_y - 0.5 * self.system.cart_height, color="0.65", lw=1.0)
+
+        self.path_line, = self.ax_robot.plot([], [], color="0.75", lw=1.5)
+        self.body_box, = self.ax_robot.plot([], [], "-", color="black", lw=2)
+        self.body_com, = self.ax_robot.plot([], [], "o", color="black", ms=4)
+        self.pole_line, = self.ax_robot.plot([], [], "-", color="tab:orange", lw=3)
+        self.force_line, = self.ax_robot.plot([], [], "-", color="tab:red", lw=2)
+
+    def _update_neural_canvas(
+        self,
+        t_ms: float,
+        obs: np.ndarray,
+        action: np.ndarray,
+        membrane: np.ndarray,
+        filtered: np.ndarray,
+        adapt: np.ndarray,
+        spike: np.ndarray,
+    ):
+        super()._update_neural_canvas(t_ms, obs, action, membrane, filtered, adapt, spike)
+        primary_force, trim_force = self.system._decode_targets(action.astype(np.float32))
+        target_values = np.concatenate([primary_force, trim_force], axis=0)
+        for idx, text in enumerate(self.output_target_texts):
+            text.set_text(f"{target_values[idx]:+.2f} N")
+
+    def _set_rollout(self, rollout, metrics):
+        self.latest_rollout = rollout
+        self.latest_metrics = metrics
+
+        ts_ms = np.asarray(rollout["ts"], dtype=float)
+        frame_stride = max(1, int(round((1000.0 / self.cfg.animation_fps) / self.cfg.dt_ms)))
+        frame_indices = np.arange(0, len(ts_ms), frame_stride, dtype=int)
+        if len(frame_indices) == 0 or frame_indices[-1] != len(ts_ms) - 1:
+            frame_indices = np.append(frame_indices, len(ts_ms) - 1)
+        self.frame_indices = frame_indices
+        self.frame_times = ts_ms[frame_indices]
+        self.frame_ptr = 0
+
+        self.rollout_cache = {
+            key: np.asarray(rollout[key], dtype=float)
+            for key in ("pos", "vel", "angle", "force", "obs", "action", "v", "filtered_spike", "adapt", "spike")
+        }
+
+        membrane = self.rollout_cache["v"]
+        filtered = self.rollout_cache["filtered_spike"]
+        adapt = self.rollout_cache["adapt"]
+        v_lo = float(min(0.0, np.percentile(membrane, 1.0)))
+        v_hi = float(max(self.cfg.v_th, np.percentile(membrane, 99.0)))
+        self.exc_nodes.set_clim(v_lo, v_hi)
+        self.inh_nodes.set_clim(v_lo, v_hi)
+        self.filtered_node_scale = float(max(1.0, np.percentile(filtered, 99.0)))
+        self.adapt_node_scale = float(max(1.0, np.percentile(adapt, 99.0)))
+
+        pos = self.rollout_cache["pos"]
+        self.robot_y_limits = (
+            float(self.system.cart_track_y - 0.75 * self.system.cart_height),
+            float(self.system.cart_track_y + self.system.pole_length + 0.15),
+        )
+        self.camera_half_width = float(max(1.5, min(self.system.track_half_width + 0.2, 2.4)))
+        self.ax_robot.set_ylim(*self.robot_y_limits)
+        self.force_scale = 0.30 * self.system.pole_length / max(
+            1.0, float(np.max(np.abs(self.rollout_cache["force"][:, 0])))
+        )
+        self._draw_frame(0)
+
+    def _draw_frame(self, frame_ptr: int):
+        if self.latest_rollout is None:
+            return
+        frame_ptr = int(np.clip(frame_ptr, 0, len(self.frame_indices) - 1))
+        self.frame_ptr = frame_ptr
+        i = int(self.frame_indices[frame_ptr])
+
+        pos = self.rollout_cache["pos"]
+        vel = self.rollout_cache["vel"]
+        angle = self.rollout_cache["angle"]
+        force = self.rollout_cache["force"]
+        obs = self.rollout_cache["obs"]
+        action = self.rollout_cache["action"]
+        membrane = self.rollout_cache["v"]
+        filtered = self.rollout_cache["filtered_spike"]
+        adapt = self.rollout_cache["adapt"]
+        spike = self.rollout_cache["spike"]
+
+        self._update_neural_canvas(
+            self.frame_times[frame_ptr],
+            obs[i],
+            action[i],
+            membrane[i],
+            filtered[i],
+            adapt[i],
+            spike[i],
+        )
+
+        p = pos[i]
+        theta = float(angle[i])
+        half_w = 0.5 * self.system.cart_width
+        half_h = 0.5 * self.system.cart_height
+        cart_outline = np.array(
+            [
+                [p[0] - half_w, p[1] + half_h],
+                [p[0] + half_w, p[1] + half_h],
+                [p[0] + half_w, p[1] - half_h],
+                [p[0] - half_w, p[1] - half_h],
+                [p[0] - half_w, p[1] + half_h],
+            ],
+            dtype=float,
+        )
+        pivot = np.array([p[0], p[1] + half_h], dtype=float)
+        tip = pivot + self.system.pole_length * np.array([np.sin(theta), np.cos(theta)], dtype=float)
+
+        self.path_line.set_data(pos[: i + 1, 0], pos[: i + 1, 1])
+        self.body_box.set_data(cart_outline[:, 0], cart_outline[:, 1])
+        self.body_com.set_data([p[0]], [p[1]])
+        self.pole_line.set_data([pivot[0], tip[0]], [pivot[1], tip[1]])
+
+        f = force[i]
+        self.force_line.set_data(
+            [p[0], p[0] + f[0] * self.force_scale],
+            [p[1], p[1]],
+        )
+        self.ax_robot.set_xlim(p[0] - self.camera_half_width, p[0] + self.camera_half_width)
+        self.ax_robot.set_title(
+            "Cart-Pole Rollout | "
+            f"epoch={self.epoch} | x={p[0]:.3f} vx={vel[i, 0]:.3f} theta={theta:.3f}"
+        )
 
 
 class TrainableSpatialWalkingSystem(_BaseTrainableWalkingSystem):
@@ -77,7 +284,41 @@ class TrainableSpatialWalkingSystem(_BaseTrainableWalkingSystem):
     def __init__(self, cfg: Config):
         _require_runtime()
         super().__init__(cfg)
-        self.compute_backend = "pymunk+spatial"
+        self.compute_backend = "cartpole+spatial"
+        self.obs_size = 9
+        self.action_size = 2 * cfg.n_legs
+        self.observation_labels = [
+            "target vx",
+            "target vy",
+            "cart x",
+            "cart vx",
+            "pole angle",
+            "pole omega",
+            "sin theta",
+            "cos theta",
+            "last force",
+        ]
+        self.action_labels = ["push +", "push -", "trim +", "trim -"]
+        self.cart_width = float(cfg.body_length)
+        self.cart_height = float(cfg.body_height)
+        self.cart_track_y = 0.5 * self.cart_height + 0.04
+        self.pole_length = float(cfg.thigh_length + cfg.shank_length)
+        self.cart_force_scale = 0.5 * float(cfg.hip_torque_limit + cfg.knee_torque_limit)
+        self.track_half_width = float(max(1.5, 6.0 * self.cart_width))
+        self.obs_scale = np.asarray(
+            [
+                max(1.0, abs(cfg.target_vx)),
+                max(1.0, abs(cfg.target_vy)),
+                self.track_half_width,
+                1.5,
+                1.0,
+                2.5,
+                1.0,
+                1.0,
+                max(1.0, self.cart_force_scale),
+            ],
+            dtype=np.float32,
+        )
 
         bm.set_dt(cfg.dt_ms)
 
@@ -343,9 +584,133 @@ class TrainableSpatialWalkingSystem(_BaseTrainableWalkingSystem):
         filt = np.zeros((self.n_total,), dtype=np.float32)
         return self._spatial_snapshot(filt=filt, step=0)
 
+    def _make_physics(self):
+        return CartPolePhysics(
+            self.cfg,
+            cart_width=self.cart_width,
+            cart_height=self.cart_height,
+            pole_length=self.pole_length,
+            force_limit=self.cart_force_scale,
+        )
+
+    def _build_observation(self, state_like, feature_t):
+        theta = float(state_like.angle)
+        obs = np.asarray(
+            [
+                feature_t[0],
+                feature_t[1],
+                state_like.pos[0],
+                state_like.vel[0],
+                theta,
+                state_like.omega,
+                np.sin(theta),
+                np.cos(theta),
+                state_like.last_force,
+            ],
+            dtype=np.float32,
+        )
+        return obs / self.obs_scale
+
+    def _decode_targets(self, action):
+        action = np.asarray(action, dtype=np.float32).reshape(self.action_size)
+        primary = self.cart_force_scale * action[: self.cfg.n_legs]
+        trim = 0.5 * self.cart_force_scale * action[self.cfg.n_legs :]
+        return primary.astype(np.float32), trim.astype(np.float32)
+
+    def _force_from_action(self, action) -> float:
+        primary_force, trim_force = self._decode_targets(action)
+        return float((primary_force[0] - primary_force[1]) + (trim_force[0] - trim_force[1]))
+
     def _simulate(self, params, features, progress_label: Optional[str] = None):
         self._apply_recurrent_params(params)
-        return super()._simulate(params, features, progress_label=progress_label)
+        physics = self._make_physics()
+        sensed = physics.observe()
+        ctrl_state = self._controller_initial_state()
+        progress = None
+        progress_stride = None
+        if progress_label:
+            progress = TerminalProgressBar(self.num_steps, progress_label)
+            progress_stride = max(1, self.num_steps // 40)
+
+        pos = np.zeros((self.num_steps, 2), dtype=np.float32)
+        vel = np.zeros((self.num_steps, 2), dtype=np.float32)
+        angle = np.zeros((self.num_steps,), dtype=np.float32)
+        omega = np.zeros((self.num_steps,), dtype=np.float32)
+        hip_angle = np.zeros((self.num_steps, self.cfg.n_legs), dtype=np.float32)
+        knee_angle = np.zeros((self.num_steps, self.cfg.n_legs), dtype=np.float32)
+        foot_pos = np.zeros((self.num_steps, self.cfg.n_legs, 2), dtype=np.float32)
+        foot_vel = np.zeros((self.num_steps, self.cfg.n_legs, 2), dtype=np.float32)
+        ground_contact = np.zeros((self.num_steps, self.cfg.n_legs), dtype=np.float32)
+        force = np.zeros((self.num_steps, 2), dtype=np.float32)
+        joint_torque = np.zeros((self.num_steps, self.cfg.n_legs, 2), dtype=np.float32)
+        obs_hist = np.zeros((self.num_steps, self.obs_size), dtype=np.float32)
+        action_hist = np.zeros((self.num_steps, self.action_size), dtype=np.float32)
+        spike_hist = np.zeros((self.num_steps, self.n_total), dtype=np.float32)
+        v_hist = np.zeros((self.num_steps, self.n_total), dtype=np.float32)
+        syn_hist = np.zeros((self.num_steps, self.n_total), dtype=np.float32)
+        adapt_hist = np.zeros((self.num_steps, self.n_total), dtype=np.float32)
+        filt_hist = np.zeros((self.num_steps, self.n_total), dtype=np.float32)
+
+        cart_offsets = np.asarray(
+            [
+                [-0.25 * self.cart_width, -0.5 * self.cart_height],
+                [0.25 * self.cart_width, -0.5 * self.cart_height],
+            ],
+            dtype=np.float32,
+        )
+
+        for t in range(self.num_steps):
+            obs = self._build_observation(sensed, features[t])
+            ctrl_state, action = self._controller_step(params, ctrl_state, obs)
+            force_cmd = self._force_from_action(action)
+            physics.step(force_cmd)
+            next_sensed = physics.observe()
+
+            pos[t] = next_sensed.pos
+            vel[t] = next_sensed.vel
+            angle[t] = np.float32(next_sensed.angle)
+            omega[t] = np.float32(next_sensed.omega)
+            foot_pos[t] = next_sensed.pos[None, :] + cart_offsets
+            foot_vel[t, :, 0] = next_sensed.vel[0]
+            force[t, 0] = np.float32(force_cmd)
+            obs_hist[t] = obs
+            action_hist[t] = action
+            spike_hist[t] = ctrl_state["spike"]
+            v_hist[t] = ctrl_state["v"]
+            syn_hist[t] = ctrl_state["syn"]
+            adapt_hist[t] = ctrl_state["adapt"]
+            filt_hist[t] = ctrl_state["filt"]
+            sensed = next_sensed
+
+            if progress is not None and ((t + 1) % progress_stride == 0 or (t + 1) == self.num_steps):
+                progress.update(t + 1)
+
+        if progress is not None:
+            progress.finish()
+
+        return {
+            "ts": np.arange(self.num_steps, dtype=np.float32) * self.cfg.dt_ms,
+            "pos": pos,
+            "vel": vel,
+            "angle": angle,
+            "omega": omega,
+            "hip_angle": hip_angle,
+            "knee_angle": knee_angle,
+            "foot_pos": foot_pos,
+            "foot_vel": foot_vel,
+            "ground_contact": ground_contact,
+            "force": force,
+            "joint_torque": joint_torque,
+            "obs": obs_hist,
+            "action": action_hist,
+            "spike": spike_hist,
+            "v": v_hist,
+            "syn": syn_hist,
+            "adapt": adapt_hist,
+            "filtered_spike": filt_hist,
+            "E.spike": spike_hist[:, : self.n_exc],
+            "I.spike": spike_hist[:, self.n_exc :],
+        }
 
     def _controller_step(self, params, ctrl_state, obs):
         obs = np.asarray(obs, dtype=np.float32)
@@ -369,6 +734,47 @@ class TrainableSpatialWalkingSystem(_BaseTrainableWalkingSystem):
 
         next_state = self._spatial_snapshot(filt=filt, step=int(ctrl_state["step"]) + 1)
         return next_state, action.astype(np.float32)
+
+    def _metrics_from_rollout(self, rollout, features):
+        pos = np.asarray(rollout["pos"], dtype=np.float32)
+        vel = np.asarray(rollout["vel"], dtype=np.float32)
+        angle = np.asarray(rollout["angle"], dtype=np.float32)
+        omega = np.asarray(rollout["omega"], dtype=np.float32)
+        force = np.asarray(rollout["force"], dtype=np.float32)
+        action = np.asarray(rollout["action"], dtype=np.float32)
+        target_vx = np.asarray(features[:, 0], dtype=np.float32)
+
+        distance = float(pos[-1, 0] - pos[0, 0])
+        mean_vx = float(np.mean(vel[:, 0]))
+        speed_tracking = float(np.mean(np.square(vel[:, 0] - target_vx)))
+        cart_center_error = float(np.mean(np.square(pos[:, 0] / max(1e-6, self.track_half_width))))
+        angle_error = float(np.mean(np.square(angle)))
+        omega_error = float(np.mean(np.square(omega)))
+        control_effort = float(np.mean(np.square(force[:, 0] / max(1e-6, self.cart_force_scale))))
+        if action.shape[0] > 1:
+            action_rate = float(np.mean(np.sum(np.square(action[1:] - action[:-1]), axis=1)))
+        else:
+            action_rate = 0.0
+
+        reward = self.cfg.reward_distance * distance + self.cfg.reward_speed * mean_vx
+        reward = reward - self.cfg.penalty_speed_tracking * speed_tracking
+        reward = reward - self.cfg.penalty_pitch * angle_error
+        reward = reward - self.cfg.penalty_height * cart_center_error
+        reward = reward - 0.25 * omega_error
+        reward = reward - self.cfg.penalty_energy * control_effort
+        reward = reward - self.cfg.penalty_action_rate * action_rate
+
+        loss = -reward
+        metrics = {
+            "loss": float(loss),
+            "reward": float(reward),
+            "distance": float(distance),
+            "mean_vx": float(mean_vx),
+            "height_error": float(cart_center_error),
+            "pitch_error": float(angle_error),
+            "speed_tracking": float(speed_tracking),
+        }
+        return loss, metrics
 
     def train_step(
         self,
@@ -611,7 +1017,7 @@ def main():
     print("[trainable_spatial_system] starting backend worker...", flush=True)
     worker_process.start()
     print("[trainable_spatial_system] opening training viewer...", flush=True)
-    viewer = TrainingViewer(system, features, message_queue, stop_event, worker_process)
+    viewer = CartPoleTrainingViewer(system, features, message_queue, stop_event, worker_process)
     try:
         viewer.show()
     finally:
