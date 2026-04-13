@@ -1009,6 +1009,8 @@ class TrainingViewer:
         self.history_distance = []
         self.history_speed = []
         self.history_loss = []
+        self.history_reward = []
+        self.history_grad_norm = []
 
         self.latest_rollout = None
         self.latest_metrics = None
@@ -1075,6 +1077,17 @@ class TrainingViewer:
 
         self.train_timer = self.fig.canvas.new_timer(interval=max(1, self.cfg.ui_interval_ms))
         self.train_timer.add_callback(self._on_train_tick)
+
+    @staticmethod
+    def _ema(values: np.ndarray, alpha: float = 0.2) -> np.ndarray:
+        values = np.asarray(values, dtype=float)
+        if values.size == 0:
+            return values
+        smoothed = np.empty_like(values, dtype=float)
+        smoothed[0] = values[0]
+        for idx in range(1, values.size):
+            smoothed[idx] = alpha * values[idx] + (1.0 - alpha) * smoothed[idx - 1]
+        return smoothed
 
     def _init_network_panel(self):
         self.ax_net.set_facecolor("#ffffff")
@@ -1267,10 +1280,47 @@ class TrainingViewer:
     def _init_metric_panel(self):
         self.distance_line, = self.ax_metric.plot([], [], color="tab:blue", label="distance")
         self.speed_line, = self.ax_metric.plot([], [], color="tab:green", label="mean vx")
+        self.reward_axis = self.ax_metric.twinx()
+        self.reward_axis.set_ylabel("reward")
+        self.reward_line, = self.reward_axis.plot([], [], color="tab:orange", label="reward")
+        self.reward_ema_line, = self.reward_axis.plot(
+            [],
+            [],
+            color="tab:red",
+            linestyle="--",
+            linewidth=1.6,
+            label="reward EMA",
+        )
         self.ax_metric.set_title("Training Progress")
         self.ax_metric.set_xlabel("epoch")
-        self.ax_metric.legend(loc="upper left")
+        self.ax_metric.set_ylabel("distance / speed")
+        handles_left, labels_left = self.ax_metric.get_legend_handles_labels()
+        handles_right, labels_right = self.reward_axis.get_legend_handles_labels()
+        self.ax_metric.legend(
+            handles_left + handles_right,
+            labels_left + labels_right,
+            loc="upper left",
+            fontsize=8,
+            framealpha=0.88,
+        )
         self.ax_metric.grid(alpha=0.25)
+        self.metric_summary_text = self.ax_metric.text(
+            0.98,
+            0.98,
+            "",
+            transform=self.ax_metric.transAxes,
+            ha="right",
+            va="top",
+            fontsize=8.5,
+            family="monospace",
+            color="#234",
+            bbox=dict(
+                boxstyle="round,pad=0.35",
+                facecolor="white",
+                edgecolor="#cad3df",
+                alpha=0.88,
+            ),
+        )
 
     def _init_status_panel(self):
         return None
@@ -1525,6 +1575,9 @@ class TrainingViewer:
         self.history_distance.append(metrics["distance"])
         self.history_speed.append(metrics["mean_vx"])
         self.history_loss.append(metrics["loss"])
+        self.history_reward.append(metrics.get("reward", -metrics["loss"]))
+        if "grad_norm" in metrics:
+            self.history_grad_norm.append(metrics["grad_norm"])
 
     def _drain_backend_messages(self):
         received = False
@@ -1719,22 +1772,56 @@ class TrainingViewer:
         if not self.history_steps:
             return
         x = np.asarray(self.history_steps, dtype=float)
-        self.distance_line.set_data(x, np.asarray(self.history_distance, dtype=float))
-        self.speed_line.set_data(x, np.asarray(self.history_speed, dtype=float))
+        distance = np.asarray(self.history_distance, dtype=float)
+        speed = np.asarray(self.history_speed, dtype=float)
+        reward = np.asarray(self.history_reward, dtype=float)
+        loss = np.asarray(self.history_loss, dtype=float)
+        reward_ema = self._ema(reward, alpha=0.18)
+
+        self.distance_line.set_data(x, distance)
+        self.speed_line.set_data(x, speed)
+        self.reward_line.set_data(x, reward)
+        self.reward_ema_line.set_data(x, reward_ema)
         self.ax_metric.set_xlim(0.0, max(1.0, x[-1]))
 
-        y_values = np.concatenate(
-            [
-                np.asarray(self.history_distance, dtype=float),
-                np.asarray(self.history_speed, dtype=float),
-            ]
+        left_values = np.concatenate([distance, speed])
+        left_min = float(np.min(left_values))
+        left_max = float(np.max(left_values))
+        if abs(left_max - left_min) < 1e-6:
+            left_max = left_min + 1.0
+        left_pad = 0.1 * (left_max - left_min)
+        self.ax_metric.set_ylim(left_min - left_pad, left_max + left_pad)
+
+        right_values = np.concatenate([reward, reward_ema])
+        right_min = float(np.min(right_values))
+        right_max = float(np.max(right_values))
+        if abs(right_max - right_min) < 1e-6:
+            right_max = right_min + 1.0
+        right_pad = 0.1 * (right_max - right_min)
+        self.reward_axis.set_ylim(right_min - right_pad, right_max + right_pad)
+
+        current_reward = float(reward[-1])
+        best_reward = float(np.max(reward))
+        start_reward = float(reward[0])
+        reward_delta = current_reward - start_reward
+        ema_reward = float(reward_ema[-1])
+        grad_norm = float(self.history_grad_norm[-1]) if self.history_grad_norm else float("nan")
+        reward_color = "#1b5e20" if reward_delta >= 0.0 else "#8a5a00"
+        self.metric_summary_text.set_color(reward_color)
+        total_epochs_label = "inf" if self.cfg.train_epochs <= 0 else str(self.cfg.train_epochs)
+        self.metric_summary_text.set_text(
+            "\n".join(
+                [
+                    f"epoch {int(x[-1])}/{total_epochs_label}",
+                    f"phase {self.current_phase}",
+                    f"reward {current_reward:+.3f}",
+                    f"best   {best_reward:+.3f}",
+                    f"ema    {ema_reward:+.3f}",
+                    f"delta  {reward_delta:+.3f}",
+                    f"grad   {grad_norm:.3g}",
+                ]
+            )
         )
-        ymin = float(np.min(y_values))
-        ymax = float(np.max(y_values))
-        if abs(ymax - ymin) < 1e-6:
-            ymax = ymin + 1.0
-        pad = 0.1 * (ymax - ymin)
-        self.ax_metric.set_ylim(ymin - pad, ymax + pad)
 
     def _on_anim_tick(self):
         if self.closed or self.latest_rollout is None:
@@ -1759,11 +1846,19 @@ class TrainingViewer:
             now = time.perf_counter()
             if self.latest_metrics is not None and (now - self.last_log_time) >= 0.5:
                 total_epochs_label = "inf" if self.cfg.train_epochs <= 0 else str(self.cfg.train_epochs)
+                reward = float(self.latest_metrics.get("reward", -self.latest_metrics["loss"]))
+                reward_delta = (
+                    reward - self.history_reward[0] if self.history_reward else 0.0
+                )
+                best_reward = max(self.history_reward) if self.history_reward else reward
                 print(
                     "[trainable_system] "
                     f"epoch={self.epoch}/{total_epochs_label} "
                     f"phase={self.current_phase} "
                     f"loss={self.latest_metrics['loss']:.4f} "
+                    f"reward={reward:.4f} "
+                    f"best={best_reward:.4f} "
+                    f"delta={reward_delta:+.4f} "
                     f"distance={self.latest_metrics['distance']:.4f} "
                     f"vx={self.latest_metrics['mean_vx']:.4f}",
                     flush=True,
