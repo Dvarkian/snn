@@ -393,6 +393,17 @@ class TrainableSpatialBPTTWalkingSystem(_ESTrainableSpatialWalkingSystem):
     def __init__(self, cfg: Config):
         _require_spatial_runtime()
         super().__init__(cfg)
+        self.bptt_chunk_steps = max(1, int(getattr(self.cfg, "bptt_chunk_steps", 128)))
+        self.bptt_curriculum_steps = max(1, int(getattr(self.cfg, "bptt_curriculum_steps", 240)))
+        self.bptt_lr_scale = float(getattr(self.cfg, "bptt_lr_scale", 4.0))
+        self.bptt_activity_weight = float(getattr(self.cfg, "bptt_activity_weight", 180.0))
+        self.bptt_exc_activity_target = float(getattr(self.cfg, "bptt_exc_activity_target", 0.018))
+        self.bptt_inh_activity_target = float(getattr(self.cfg, "bptt_inh_activity_target", 0.010))
+        self.bptt_initial_x_jitter = float(getattr(self.cfg, "bptt_initial_x_jitter", 0.02))
+        self.bptt_initial_x_dot_jitter = float(getattr(self.cfg, "bptt_initial_x_dot_jitter", 0.04))
+        self.bptt_initial_theta_jitter = float(getattr(self.cfg, "bptt_initial_theta_jitter", 0.06))
+        self.bptt_initial_theta_dot_jitter = float(getattr(self.cfg, "bptt_initial_theta_dot_jitter", 0.10))
+        self.bptt_randomize_external_seed = bool(getattr(self.cfg, "bptt_randomize_external_seed", True))
         self._enable_spatial_training_mode()
         self.compute_backend = "cartpole+spatial+bptt"
         self.rollout_model = _DifferentiableSpatialCartPoleRollout(self)
