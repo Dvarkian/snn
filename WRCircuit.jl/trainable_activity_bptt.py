@@ -11,29 +11,33 @@ from typing import Optional, Dict, Any, Tuple
 # Set up environment
 os.environ["PYDEVD_DISABLE_FILE_VALIDATION"] = "1"
 
-# Import existing model and monkey-patch for BPTT
+# Import existing model components
 try:
-    import src.neurons as _neurons
-    _neurons.stop_gradient = jax.lax.stop_gradient
-    # Force float32 spikes for BPTT compatibility even during initialization
-    _orig_get_spk_type = _neurons.get_spk_type
-    _neurons.get_spk_type = lambda spk_type, mode: jnp.float32
-    
-    from src.models.Spatial import Spatial
     from src.neurons import FNSNeuron
+    from src.models.Spatial import Spatial
+    import src.neurons as _neurons
 except ImportError:
     import sys
     sys.path.append(os.getcwd())
-    import src.neurons as _neurons
-    _neurons.stop_gradient = jax.lax.stop_gradient
-    _orig_get_spk_type = _neurons.get_spk_type
-    _neurons.get_spk_type = lambda spk_type, mode: jnp.float32
-    from src.models.Spatial import Spatial
     from src.neurons import FNSNeuron
+    from src.models.Spatial import Spatial
+    import src.neurons as _neurons
+
+# Monkey-patch FNSNeuron to FORCE float32 spikes via spk_dtype argument.
+# This ensures that during initial setup (NormalMode), the spike Variable is created
+# with float32 dtype, making it compatible with BPTT surrogate gradients later.
+_orig_fns_init = FNSNeuron.__init__
+def _patched_fns_init(self, *args, **kwargs):
+    # Force spk_dtype to float32 regardless of other settings
+    kwargs['spk_dtype'] = jnp.float32
+    return _orig_fns_init(self, *args, **kwargs)
+FNSNeuron.__init__ = _patched_fns_init
+
+# Monkey-patch missing stop_gradient dependency
+_neurons.stop_gradient = jax.lax.stop_gradient
 
 class Config:
     def __init__(self):
-        # Balanced parameters for Spatial model stability
         self.rho = 6000 
         self.dx = 0.5
         self.dt = 0.5
@@ -43,7 +47,7 @@ class Config:
         self.target_rate_exc = 0.025
         self.target_rate_inh = 0.020
         self.smooth_tau = 12.0
-        self.nu = 25.0 # Health background stochastic drive
+        self.nu = 25.0
         self.ui_update_interval = 2
         self.dark_mode = True
         self.colors = {'exc': '#FF2E63', 'inh': '#08D9D6', 'bg': '#1A1A1D', 'text': '#EAEAEA'}
@@ -53,10 +57,10 @@ class DifferentiableSNN(bp.DynamicalSystem):
         super().__init__()
         self.cfg = cfg
         self.model = spatial_model
-        # Use built-in background drive
+        # Use built-in Stochastic Background Population
         self.model.reinit_nu(cfg.nu)
         
-        # Mark recurrent weights as trainable
+        # Trainable recurrent weights
         self.w_ee = bm.TrainVar(self.model.E2E.proj.comm.weight)
         self.w_ei = bm.TrainVar(self.model.E2I.proj.comm.weight)
         self.w_ie = bm.TrainVar(self.model.I2E.proj.comm.weight)
@@ -91,10 +95,10 @@ class SNNTrainer(bp.DynamicalSystem):
     def __init__(self, cfg: Config):
         super().__init__()
         self.cfg = cfg
-        # Initialize in NormalMode to allow flexible weight assignment in reinit_weights
+        # Step 1: Initialize Spatial model (NormalMode) with forced float32 spikes
         self.spatial = Spatial(rho=cfg.rho, dx=cfg.dx, key=42, nu=cfg.nu)
         
-        # Now explicitly enable TrainingMode for differential simulation
+        # Step 2: Now enable TrainingMode
         self.spatial.mode = bm.TrainingMode()
         self.spatial.E.mode = bm.TrainingMode()
         self.spatial.I.mode = bm.TrainingMode()
@@ -115,7 +119,7 @@ class SNNTrainer(bp.DynamicalSystem):
             return bm.mean(outs[-1]), outs
         @bm.jit
         def _update():
-            # (grads, loss, aux) structure for BrainPy 2.6.0 bm.grad(dict, has_aux=True, return_value=True)
+            # Unpack (grads, loss, aux)
             grads, loss, outs = bm.grad(_loss_fn, grad_vars=self.diff_snn.trainable_vars, has_aux=True, return_value=True)()
             self.opt.update(grads)
             return loss, outs
@@ -133,26 +137,30 @@ class UI:
         self.trainer = trainer; self.cfg = trainer.cfg
         if self.cfg.dark_mode: plt.style.use('dark_background')
         self.fig, self.axs = plt.subplots(2, 2, figsize=(14, 8))
-        self.fig.tight_layout(pad=4.0)
+        self.fig.tight_layout(pad=4.5)
     def update(self, loss):
         s_e, s_i, r_e, r_i, _ = [np.asarray(x) for x in self.trainer.last_rollout]
-        ts = np.linspace(0, self.cfg.duration, self.cfg.steps); targets = np.asarray(self.trainer.target_rates)
+        ts = np.linspace(0, self.cfg.duration, self.cfg.steps)
+        targets = np.asarray(self.trainer.target_rates)
         ax = self.axs[0, 0]; ax.clear()
         se_sel = np.linspace(0, s_e.shape[1]-1, min(s_e.shape[1], 40), dtype=int)
         for i, idx in enumerate(se_sel):
             t = ts[s_e[:, idx] > 0]
             ax.scatter(t, np.ones_like(t)*i, s=2, color=self.cfg.colors['exc'])
+        ax.set_title(f"Raster Plot - Epoch {self.trainer.epoch}")
         ax = self.axs[1, 0]; ax.clear()
         ax.plot(ts, targets[:, 0], '--', alpha=0.15); ax.plot(ts, r_e, color=self.cfg.colors['exc'], lw=2); ax.plot(ts, r_i, color=self.cfg.colors['inh'], lw=2)
-        ax = self.axs[0, 1]; ax.clear(); ax.plot(self.trainer.loss_history, color='yellow'); ax.set_yscale('log')
+        ax.set_title("Target vs Observed Rates")
+        ax = self.axs[0, 1]; ax.clear(); ax.plot(self.trainer.loss_history, color='yellow'); ax.set_yscale('log'); ax.set_title("Training Loss")
         ax = self.axs[1, 1]; ax.clear()
         w_vals = [np.mean(np.abs(np.asarray(v))) for v in self.trainer.diff_snn.trainable_vars.values()]
         ax.bar(['EE', 'EI', 'IE', 'II'], w_vals, color=['#FF2E63']*2 + ['#08D9D6']*2)
+        ax.set_title("Mean Weights")
         plt.draw(); plt.pause(0.01)
 
 def main():
     cfg = Config(); trainer = SNNTrainer(cfg); ui = UI(trainer)
-    print(f"SNN BPTT Started. Stochastic Drive: Spatial.nu={cfg.nu}Hz")
+    print(f"SNN BPTT Active. stochastic Drive: Spatial.nu={cfg.nu}Hz")
     try:
         while True:
             loss = trainer.run_epoch()
