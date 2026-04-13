@@ -86,6 +86,22 @@ class _DifferentiableSpatialCartPoleRollout(_BPTT_BASE):
         self.w_ii_raw = bm.TrainVar(bm.asarray(np.asarray(system.params["w_ii_raw"], dtype=np.float32)))
 
         self._initial_ext_seed = bm.asarray(np.asarray(self.spatial_model.ext.seed.value))
+        self.bptt_chunk_steps = max(1, int(getattr(self.cfg, "bptt_chunk_steps", 128)))
+        self.bptt_curriculum_steps = max(1, int(getattr(self.cfg, "bptt_curriculum_steps", 240)))
+        self.bptt_lr_scale = float(getattr(self.cfg, "bptt_lr_scale", 4.0))
+        self.bptt_activity_weight = float(getattr(self.cfg, "bptt_activity_weight", 180.0))
+        self.bptt_exc_activity_target = float(getattr(self.cfg, "bptt_exc_activity_target", 0.018))
+        self.bptt_inh_activity_target = float(getattr(self.cfg, "bptt_inh_activity_target", 0.010))
+        self.bptt_initial_x_jitter = float(getattr(self.cfg, "bptt_initial_x_jitter", 0.02))
+        self.bptt_initial_x_dot_jitter = float(getattr(self.cfg, "bptt_initial_x_dot_jitter", 0.04))
+        self.bptt_initial_theta_jitter = float(getattr(self.cfg, "bptt_initial_theta_jitter", 0.06))
+        self.bptt_initial_theta_dot_jitter = float(getattr(self.cfg, "bptt_initial_theta_dot_jitter", 0.10))
+        self.bptt_randomize_external_seed = bool(getattr(self.cfg, "bptt_randomize_external_seed", True))
+        self._time_weights = bm.asarray(np.linspace(0.75, 1.25, self.num_steps, dtype=np.float32))
+        self._action_weights = bm.asarray(
+            np.linspace(0.75, 1.25, max(1, self.num_steps - 1), dtype=np.float32)
+        )
+        self._train_step_count = 0
 
         self.x = bm.Variable(bm.asarray(0.0, dtype=bm.float_))
         self.x_dot = bm.Variable(bm.asarray(0.0, dtype=bm.float_))
@@ -122,6 +138,61 @@ class _DifferentiableSpatialCartPoleRollout(_BPTT_BASE):
         self.last_force.value = bm.asarray(0.0, dtype=bm.float_)
         self.filt.value = bm.zeros((self.n_total,), dtype=bm.float_)
 
+    def _training_initial_state(self):
+        progress = min(1.0, self._train_step_count / float(self.bptt_curriculum_steps))
+        base_pitch = float(self.cfg.initial_pitch) * (0.40 + 0.60 * progress)
+        noise_scale = 0.45 + 0.55 * progress
+
+        x = self.rng.normal(0.0, self.bptt_initial_x_jitter * noise_scale)
+        x_dot = self.rng.normal(0.0, self.bptt_initial_x_dot_jitter * noise_scale)
+        theta = base_pitch + self.rng.normal(0.0, self.bptt_initial_theta_jitter * noise_scale)
+        theta_dot = self.rng.normal(0.0, self.bptt_initial_theta_dot_jitter * noise_scale)
+
+        if self.bptt_randomize_external_seed:
+            seed = jax.random.PRNGKey(int(self.rng.integers(0, 2**31 - 1)))
+        else:
+            seed = self._initial_ext_seed
+
+        return {
+            "x": x,
+            "x_dot": x_dot,
+            "theta": theta,
+            "theta_dot": theta_dot,
+            "seed": seed,
+        }
+
+    def _apply_training_initial_state(self):
+        state = self._training_initial_state()
+        self.x.value = bm.asarray(state["x"], dtype=bm.float_)
+        self.x_dot.value = bm.asarray(state["x_dot"], dtype=bm.float_)
+        self.theta.value = bm.asarray(state["theta"], dtype=bm.float_)
+        self.theta_dot.value = bm.asarray(state["theta_dot"], dtype=bm.float_)
+        self.last_force.value = bm.asarray(0.0, dtype=bm.float_)
+        self.filt.value = bm.zeros((self.n_total,), dtype=bm.float_)
+        if hasattr(self.spatial_model.ext, "seed"):
+            self.spatial_model.ext.seed.value = bm.asarray(state["seed"])
+
+    @staticmethod
+    def _detach_value(value):
+        return jax.lax.stop_gradient(value)
+
+    def _truncate_bptt_state(self):
+        for variable in (self.x, self.x_dot, self.theta, self.theta_dot, self.last_force, self.filt):
+            variable.value = self._detach_value(variable.value)
+        if hasattr(self.spatial_model.ext, "seed"):
+            self.spatial_model.ext.seed.value = self._detach_value(self.spatial_model.ext.seed.value)
+        for neuron_group in (self.spatial_model.E, self.spatial_model.I):
+            for attr in ("V", "g_K", "spike", "t_last_spike", "input"):
+                target = getattr(neuron_group, attr, None)
+                if hasattr(target, "value"):
+                    target.value = self._detach_value(target.value)
+
+    @staticmethod
+    def _concat_chunk_outputs(chunk_outputs):
+        if len(chunk_outputs) == 1:
+            return chunk_outputs[0]
+        return jax.tree_util.tree_map(lambda *xs: bm.concatenate(xs, axis=0), *chunk_outputs)
+
     def sync_fixed_params(self, params):
         self.w_in = bm.asarray(np.asarray(params["w_in"], dtype=np.float32))
         self.bias_in = bm.asarray(np.asarray(params["bias_in"], dtype=np.float32))
@@ -148,9 +219,21 @@ class _DifferentiableSpatialCartPoleRollout(_BPTT_BASE):
 
     def run(self, features):
         features = bm.asarray(features)
-        indices = bm.arange(features.shape[0])
         self.sync_recurrent_weights()
-        return bm.for_loop(self.step_run, (indices, features), progress_bar=False)
+        num_steps = int(features.shape[0])
+        chunk_steps = max(1, int(self.bptt_chunk_steps))
+        chunk_outputs = []
+
+        for start in range(0, num_steps, chunk_steps):
+            end = min(num_steps, start + chunk_steps)
+            indices = bm.arange(start, end)
+            chunk_outputs.append(
+                bm.for_loop(self.step_run, (indices, features[start:end]), progress_bar=False)
+            )
+            if end < num_steps:
+                self._truncate_bptt_state()
+
+        return self._concat_chunk_outputs(chunk_outputs)
 
     def _build_observation(self, feature_t):
         theta = self.theta.value
@@ -399,22 +482,62 @@ class TrainableSpatialBPTTWalkingSystem(_ESTrainableSpatialWalkingSystem):
             return {key: float(np.asarray(value)) for key, value in metrics.items()}
         return {}
 
+    def _metrics_from_rollout(self, rollout, features):
+        loss, metrics = super()._metrics_from_rollout(rollout, features)
+        spike = np.asarray(rollout["spike"], dtype=np.float32)
+        if spike.size:
+            exc_rate = float(np.mean(spike[:, : self.n_exc]))
+            inh_rate = float(np.mean(spike[:, self.n_exc :]))
+        else:
+            exc_rate = 0.0
+            inh_rate = 0.0
+        activity_penalty = float(
+            self.bptt_activity_weight
+            * (
+                (exc_rate - self.bptt_exc_activity_target) ** 2
+                + 0.5 * (inh_rate - self.bptt_inh_activity_target) ** 2
+            )
+        )
+        metrics["reward"] = float(metrics["reward"]) - activity_penalty
+        loss = float(loss) + activity_penalty
+        metrics["loss"] = loss
+        metrics["exc_rate"] = exc_rate
+        metrics["inh_rate"] = inh_rate
+        metrics["activity_penalty"] = activity_penalty
+        return loss, metrics
+
     def _loss_from_outputs(self, outputs, features):
         pos, vel, angle, omega, force, _obs, action, _v, _syn, _adapt, _filt, _spike = outputs
         target_vx = bm.asarray(features[:, 0])
+        time_weights = self._time_weights[: pos.shape[0]]
+        action_weights = self._action_weights[: max(1, action.shape[0] - 1)]
+
+        def _weighted_mean(value, weights):
+            denom = bm.maximum(bm.sum(weights), bm.asarray(1e-6, dtype=bm.float_))
+            return bm.sum(weights * value) / denom
 
         distance = pos[-1, 0] - pos[0, 0]
         mean_vx = bm.mean(vel[:, 0])
-        speed_tracking = bm.mean((vel[:, 0] - target_vx) ** 2)
-        cart_center_error = bm.mean((pos[:, 0] / max(1e-6, self.track_half_width)) ** 2)
-        angle_error = bm.mean(angle**2)
-        omega_error = bm.mean(omega**2)
-        control_effort = bm.mean((force[:, 0] / max(1e-6, self.cart_force_scale)) ** 2)
+        speed_tracking = _weighted_mean((vel[:, 0] - target_vx) ** 2, time_weights)
+        cart_center_error = _weighted_mean((pos[:, 0] / max(1e-6, self.track_half_width)) ** 2, time_weights)
+        angle_error = _weighted_mean(angle**2, time_weights)
+        omega_error = _weighted_mean(omega**2, time_weights)
+        control_effort = _weighted_mean((force[:, 0] / max(1e-6, self.cart_force_scale)) ** 2, time_weights)
 
         if self.num_steps > 1:
-            action_rate = bm.mean(bm.sum((action[1:] - action[:-1]) ** 2, axis=1))
+            action_rate = _weighted_mean(
+                bm.sum((action[1:] - action[:-1]) ** 2, axis=1),
+                action_weights,
+            )
         else:
             action_rate = bm.asarray(0.0, dtype=bm.float_)
+
+        exc_rate = bm.mean(_spike[:, : self.n_exc])
+        inh_rate = bm.mean(_spike[:, self.n_exc :])
+        activity_penalty = self.bptt_activity_weight * (
+            (exc_rate - self.bptt_exc_activity_target) ** 2
+            + 0.5 * (inh_rate - self.bptt_inh_activity_target) ** 2
+        )
 
         reward = self.cfg.reward_distance * distance + self.cfg.reward_speed * mean_vx
         reward = reward - self.cfg.penalty_speed_tracking * speed_tracking
@@ -423,6 +546,7 @@ class TrainableSpatialBPTTWalkingSystem(_ESTrainableSpatialWalkingSystem):
         reward = reward - 0.25 * omega_error
         reward = reward - self.cfg.penalty_energy * control_effort
         reward = reward - self.cfg.penalty_action_rate * action_rate
+        reward = reward - activity_penalty
 
         loss = -reward
         metrics = {
@@ -433,6 +557,9 @@ class TrainableSpatialBPTTWalkingSystem(_ESTrainableSpatialWalkingSystem):
             "height_error": cart_center_error,
             "pitch_error": angle_error,
             "speed_tracking": speed_tracking,
+            "exc_rate": exc_rate,
+            "inh_rate": inh_rate,
+            "activity_penalty": activity_penalty,
         }
         return loss, metrics
 
@@ -516,6 +643,33 @@ class TrainableSpatialBPTTWalkingSystem(_ESTrainableSpatialWalkingSystem):
             for key, value in zip(self._TRAINABLE_RECURRENT_KEYS, grads)
         }
 
+    def _adam_update(self, params, grads):
+        cfg = self.cfg
+        lr = float(cfg.learning_rate) * self.bptt_lr_scale
+        state = self.opt_state
+        step = state.step + 1
+        m = jax.tree_util.tree_map(
+            lambda mm, gg: cfg.adam_beta1 * mm + (1.0 - cfg.adam_beta1) * gg.astype(np.float32),
+            state.m,
+            grads,
+        )
+        v = jax.tree_util.tree_map(
+            lambda vv, gg: cfg.adam_beta2 * vv + (1.0 - cfg.adam_beta2) * np.square(gg),
+            state.v,
+            grads,
+        )
+        m_hat = jax.tree_util.tree_map(lambda mm: mm / (1.0 - cfg.adam_beta1**step), m)
+        v_hat = jax.tree_util.tree_map(lambda vv: vv / (1.0 - cfg.adam_beta2**step), v)
+        params = jax.tree_util.tree_map(
+            lambda pp, mm, vv: (1.0 - lr * cfg.weight_decay) * pp
+            - lr * mm / (np.sqrt(vv) + cfg.adam_eps),
+            params,
+            m_hat,
+            v_hat,
+        )
+        self.opt_state = AdamState(step=step, m=m, v=v)
+        return params
+
     def train_step(
         self,
         features: Optional[np.ndarray] = None,
@@ -524,6 +678,7 @@ class TrainableSpatialBPTTWalkingSystem(_ESTrainableSpatialWalkingSystem):
         features = self._coerce_features(features)
         self._sync_rollout_model_from_params(self.params)
         self.rollout_model.reset_state()
+        self.rollout_model._apply_training_initial_state()
         step_prefix = progress_prefix or "bptt step"
 
         _log(f"{step_prefix}: computing surrogate-gradient BPTT update")
@@ -541,7 +696,11 @@ class TrainableSpatialBPTTWalkingSystem(_ESTrainableSpatialWalkingSystem):
         if pre_metrics:
             _log(
                 f"{step_prefix}: pre-update "
-                f"loss={float(np.asarray(train_loss)):.4f} reward={pre_metrics.get('reward', float('nan')):.4f}"
+                f"loss={float(np.asarray(train_loss)):.4f} "
+                f"reward={pre_metrics.get('reward', float('nan')):.4f} "
+                f"exc_rate={pre_metrics.get('exc_rate', float('nan')):.4f} "
+                f"inh_rate={pre_metrics.get('inh_rate', float('nan')):.4f} "
+                f"activity={pre_metrics.get('activity_penalty', float('nan')):.4f}"
             )
 
         updated_trainable = self._adam_update(self._trainable_params(self.params), grad_accum)
@@ -552,7 +711,12 @@ class TrainableSpatialBPTTWalkingSystem(_ESTrainableSpatialWalkingSystem):
         loss, metrics = self._metrics_from_rollout(rollout, features)
         metrics["loss"] = float(loss)
         metrics["grad_norm"] = grad_norm
-        _log(f"{step_prefix}: complete {_metrics_summary(metrics)}")
+        _log(
+            f"{step_prefix}: complete {_metrics_summary(metrics)} "
+            f"exc_rate={metrics.get('exc_rate', float('nan')):.4f} "
+            f"inh_rate={metrics.get('inh_rate', float('nan')):.4f}"
+        )
+        self._train_step_count += 1
         return metrics
 
 
