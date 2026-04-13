@@ -107,8 +107,8 @@ class _DifferentiableSpatialCartPoleRollout(_BPTT_BASE):
         self.spatial_model.I._mode = training_mode
         for proj_name in ("E2E", "E2I", "I2E", "I2I", "ext2E", "ext2I"):
             getattr(self.spatial_model, proj_name)._mode = training_mode
-        self._upgrade_spike_buffer(self.spatial_model.E)
-        self._upgrade_spike_buffer(self.spatial_model.I)
+        self.system._upgrade_spike_buffer(self.spatial_model.E)
+        self.system._upgrade_spike_buffer(self.spatial_model.I)
 
     def reset_state(self, batch_or_mode=None, **kwargs):
         bp.reset_state(self.spatial_model)
