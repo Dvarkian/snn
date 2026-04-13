@@ -96,8 +96,23 @@ class _DifferentiableSpatialCartPoleRollout(_BPTT_BASE):
 
         self.reset_state()
 
+    @staticmethod
+    def _training_mode():
+        return bm.TrainingMode() if hasattr(bm, "TrainingMode") else bm.training_mode
+
+    def _apply_training_state(self):
+        training_mode = self._training_mode()
+        self.spatial_model._mode = training_mode
+        self.spatial_model.E._mode = training_mode
+        self.spatial_model.I._mode = training_mode
+        for proj_name in ("E2E", "E2I", "I2E", "I2I", "ext2E", "ext2I"):
+            getattr(self.spatial_model, proj_name)._mode = training_mode
+        self._upgrade_spike_buffer(self.spatial_model.E)
+        self._upgrade_spike_buffer(self.spatial_model.I)
+
     def reset_state(self, batch_or_mode=None, **kwargs):
         bp.reset_state(self.spatial_model)
+        self._apply_training_state()
         if hasattr(self.spatial_model.ext, "seed"):
             self.spatial_model.ext.seed.value = bm.asarray(self._initial_ext_seed)
         self.x.value = bm.asarray(0.0, dtype=bm.float_)
@@ -312,6 +327,11 @@ class TrainableSpatialBPTTWalkingSystem(_ESTrainableSpatialWalkingSystem):
     @staticmethod
     def _upgrade_spike_buffer(neuron_group):
         spike_shape = tuple(int(v) for v in np.asarray(neuron_group.spike.value).shape)
+        if hasattr(neuron_group, "spk_dtype"):
+            try:
+                neuron_group.spk_dtype = bm.float_
+            except Exception:
+                pass
         object.__setattr__(
             neuron_group,
             "spike",
@@ -333,6 +353,46 @@ class TrainableSpatialBPTTWalkingSystem(_ESTrainableSpatialWalkingSystem):
             has_aux=True,
             return_value=True,
         )
+
+    @staticmethod
+    def _looks_like_scalar(value) -> bool:
+        try:
+            return np.asarray(value).ndim == 0
+        except Exception:
+            return False
+
+    def _split_grad_output(self, result):
+        if not isinstance(result, tuple) or len(result) != 3:
+            raise RuntimeError(
+                "Unexpected BPTT result shape from bm.grad; expected a 3-tuple of "
+                "(grads, loss, metrics)."
+            )
+
+        grads = None
+        loss = None
+        metrics = None
+        expected_keys = set(self._TRAINABLE_RECURRENT_KEYS)
+
+        for item in result:
+            if hasattr(item, "items"):
+                keys = set(item.keys())
+                if keys == expected_keys:
+                    grads = item
+                elif all(self._looks_like_scalar(v) for v in item.values()):
+                    metrics = item
+                else:
+                    # Prefer a non-scalar mapping as the gradient tree if the keys are ambiguous.
+                    grads = item
+            elif self._looks_like_scalar(item):
+                loss = item
+            else:
+                grads = item
+
+        if grads is None or loss is None or metrics is None:
+            raise RuntimeError(
+                "Could not classify bm.grad output into gradients, loss, and metrics."
+            )
+        return grads, loss, metrics
 
     @staticmethod
     def _metrics_to_python(metrics) -> dict[str, float]:
@@ -466,7 +526,8 @@ class TrainableSpatialBPTTWalkingSystem(_ESTrainableSpatialWalkingSystem):
         step_prefix = progress_prefix or "bptt step"
 
         _log(f"{step_prefix}: computing surrogate-gradient BPTT update")
-        grads, train_loss, train_metrics = self._grad_fun(bm.asarray(np.asarray(features, dtype=np.float32)))
+        grad_result = self._grad_fun(bm.asarray(np.asarray(features, dtype=np.float32)))
+        grads, train_loss, train_metrics = self._split_grad_output(grad_result)
         grad_accum = self._grads_to_numpy(grads)
         grad_norm = float(_tree_global_norm(grad_accum))
 
