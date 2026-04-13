@@ -53,6 +53,8 @@ class _DifferentiableSpatialCartPoleRollout(_BPTT_BASE):
         self.n_total = int(system.n_total)
         self.obs_size = int(system.obs_size)
         self.action_size = int(system.action_size)
+        self.num_steps = int(system.num_steps)
+        self.rng = system.rng
 
         self.dt = float(self.cfg.dt_ms) / 1000.0
         self.g = float(self.cfg.gravity)
