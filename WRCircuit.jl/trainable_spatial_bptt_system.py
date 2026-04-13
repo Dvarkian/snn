@@ -150,7 +150,6 @@ class _DifferentiableSpatialCartPoleRollout(_BPTT_BASE):
         features = bm.asarray(features)
         indices = bm.arange(features.shape[0])
         self.sync_recurrent_weights()
-        self.reset_state()
         return bm.for_loop(self.step_run, (indices, features), progress_bar=False)
 
     def _build_observation(self, feature_t):
@@ -500,6 +499,7 @@ class TrainableSpatialBPTTWalkingSystem(_ESTrainableSpatialWalkingSystem):
 
     def _simulate(self, params, features, progress_label: Optional[str] = None):
         self._sync_rollout_model_from_params(params)
+        self.rollout_model.reset_state()
         if progress_label:
             _log(f"{progress_label}: running differentiable spatial rollout")
         outputs = self.rollout_model.run(features)
@@ -523,6 +523,7 @@ class TrainableSpatialBPTTWalkingSystem(_ESTrainableSpatialWalkingSystem):
     ) -> dict[str, float]:
         features = self._coerce_features(features)
         self._sync_rollout_model_from_params(self.params)
+        self.rollout_model.reset_state()
         step_prefix = progress_prefix or "bptt step"
 
         _log(f"{step_prefix}: computing surrogate-gradient BPTT update")
