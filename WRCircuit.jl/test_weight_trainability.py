@@ -27,7 +27,7 @@ print("TEST 1: Model Initialization in Training Mode")
 print("=" * 60)
 
 try:
-    # Set training mode
+    # Set simulation mode first (as done in trainable_spatial_bptt_system.py)
     bm.set_environment(mode=bm.training_mode, dt=1.0)
     print("✓ Training mode set successfully")
 except Exception as e:
@@ -43,20 +43,29 @@ try:
     print(f"  - Network size: {model.N_e} excitatory, {model.N_i} inhibitory")
 except Exception as e:
     print(f"✗ Failed to initialize model in training mode: {e}")
-    print("\nTrying simulation mode instead to test basic functionality...")
+    print("\nTrying the wrapper approach used in trainable_spatial_bptt_system.py...")
+    print("This involves initializing in default mode, then manually setting training mode.")
     try:
-        # Try in simulation mode
-        bm.set_environment(mode=bm.simulation_mode, dt=1.0)
+        # Try default initialization
         import jax
         key = jax.random.PRNGKey(42)
         model = Spatial(rho=1000, dx=0.5, key=key)  # Smaller network
-        print("✓ Model initialized successfully in simulation mode")
+        print("✓ Model initialized successfully in default mode")
         print(f"  - Network size: {model.N_e} excitatory, {model.N_i} inhibitory")
-        print("\nNote: Training mode initialization failed. This suggests Spatial.py")
-        print("may not be compatible with training mode. Will continue with simulation mode")
-        print("to test weight accessibility, but gradient computation may not work.")
+        
+        # Now manually set training mode on components (as in trainable_spatial_bptt_system.py lines 412-420)
+        training_mode = bm.TrainingMode() if hasattr(bm, "TrainingMode") else bm.training_mode
+        model._mode = training_mode
+        model.E._mode = training_mode
+        model.I._mode = training_mode
+        for proj_name in ("E2E", "E2I", "I2E", "I2I", "ext2E", "ext2I"):
+            getattr(model, proj_name)._mode = training_mode
+        print("✓ Manually set training mode on all components")
+        
+        print("\nNote: Using wrapper approach - model initialized in default mode,")
+        print("then training mode manually set on components.")
     except Exception as e2:
-        print(f"✗ Also failed in simulation mode: {e2}")
+        print(f"✗ Wrapper approach also failed: {e2}")
         import traceback
         traceback.print_exc()
         sys.exit(1)
