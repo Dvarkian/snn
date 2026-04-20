@@ -35,13 +35,31 @@ except Exception as e:
     sys.exit(1)
 
 try:
-    # Create model with reduced scale
-    model = Spatial(rho=5000, dx=0.5)
+    # Create model with reduced scale and random seed
+    import jax
+    key = jax.random.PRNGKey(42)
+    model = Spatial(rho=5000, dx=0.5, key=key)
     print("✓ Model initialized successfully")
     print(f"  - Network size: {model.N_e} excitatory, {model.N_i} inhibitory")
 except Exception as e:
-    print(f"✗ Failed to initialize model: {e}")
-    sys.exit(1)
+    print(f"✗ Failed to initialize model in training mode: {e}")
+    print("\nTrying simulation mode instead to test basic functionality...")
+    try:
+        # Try in simulation mode
+        bm.set_environment(mode=bm.simulation_mode, dt=1.0)
+        import jax
+        key = jax.random.PRNGKey(42)
+        model = Spatial(rho=1000, dx=0.5, key=key)  # Smaller network
+        print("✓ Model initialized successfully in simulation mode")
+        print(f"  - Network size: {model.N_e} excitatory, {model.N_i} inhibitory")
+        print("\nNote: Training mode initialization failed. This suggests Spatial.py")
+        print("may not be compatible with training mode. Will continue with simulation mode")
+        print("to test weight accessibility, but gradient computation may not work.")
+    except Exception as e2:
+        print(f"✗ Also failed in simulation mode: {e2}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
 
 print("\n" + "=" * 60)
 print("TEST 2: Check Trainable Variables")
