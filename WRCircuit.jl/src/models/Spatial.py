@@ -152,7 +152,6 @@ class Spatial(bp.Network):
         method="exp_auto",
         key=None,
         copy_conn=False,  # Whether to copy connectivity from the provided WRCircuit
-        skip_weight_init=False,  # Skip weight initialization for training mode compatibility
     ):
         super().__init__()
 
@@ -433,8 +432,7 @@ class Spatial(bp.Network):
         self.I.add_inp_fun("", self.Iin)
 
         # * Posthoc weight updates to maintain mean_weight = 1/sqrt(in-degree) per neuron
-        if not skip_weight_init:
-            self.reinit_weights(self.delta, (self.J_ee, self.J_ei))
+        self.reinit_weights(self.delta, (self.J_ee, self.J_ei))
 
     def reinit_weights(self, delta=None, J_e=None):
         if delta is not None:
@@ -473,51 +471,6 @@ class Spatial(bp.Network):
             self.ext2I.proj, self.J_ei, self.N_i, subkey
         )
         self.reset_state()  ## or bp.reset_state(self)??
-
-    def reinit_weights_training(self, delta=None, J_e=None):
-        """
-        Training-compatible version of reinit_weights that uses .value setter
-        for weight assignment, which is compatible with BrainPy training mode.
-        
-        This method should be used instead of reinit_weights when initializing
-        the model in training mode.
-        """
-        if delta is not None:
-            self.delta = delta
-        if J_e is not None:
-            self.J_ee = J_e[0]
-            self.J_ei = J_e[1]
-
-        self.J_ie = self.J_ee * self.delta
-        self.J_ii = self.J_ei * self.delta
-        self.key, subkey = jax.random.split(self.key)
-        self.E2E.proj.comm.weight.value = correlate_weights(
-            self.E2E.proj,
-            self.J_ee,
-            self.N_e,
-            subkey,
-        )
-        self.key, subkey = jax.random.split(self.key)
-        self.E2I.proj.comm.weight.value = correlate_weights(
-            self.E2I.proj, self.J_ei, self.N_i, subkey
-        )
-        self.key, subkey = jax.random.split(self.key)
-        self.I2E.proj.comm.weight.value = correlate_weights(
-            self.I2E.proj, self.J_ie, self.N_e, subkey
-        )
-        self.key, subkey = jax.random.split(self.key)
-        self.I2I.proj.comm.weight.value = correlate_weights(
-            self.I2I.proj, self.J_ii, self.N_i, subkey
-        )
-        self.key, subkey = jax.random.split(self.key)
-        self.ext2E.proj.comm.weight.value = correlate_weights(
-            self.ext2E.proj, self.J_ee, self.N_e, subkey
-        )
-        self.key, subkey = jax.random.split(self.key)
-        self.ext2I.proj.comm.weight.value = correlate_weights(
-            self.ext2I.proj, self.J_ei, self.N_i, subkey
-        )
-        self.reset_state()
 
     def reinit_nu(self, nu):
         self.nu = nu
