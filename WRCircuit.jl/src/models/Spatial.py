@@ -152,6 +152,7 @@ class Spatial(bp.Network):
         method="exp_auto",
         key=None,
         copy_conn=False,  # Whether to copy connectivity from the provided WRCircuit
+        skip_weight_init=False,  # Skip weight initialization for training mode compatibility
     ):
         super().__init__()
 
@@ -432,7 +433,8 @@ class Spatial(bp.Network):
         self.I.add_inp_fun("", self.Iin)
 
         # * Posthoc weight updates to maintain mean_weight = 1/sqrt(in-degree) per neuron
-        self.reinit_weights(self.delta, (self.J_ee, self.J_ei))
+        if not skip_weight_init:
+            self.reinit_weights(self.delta, (self.J_ee, self.J_ei))
 
     def reinit_weights(self, delta=None, J_e=None):
         if delta is not None:

@@ -35,46 +35,34 @@ except Exception as e:
     sys.exit(1)
 
 try:
-    # Create model with reduced scale and random seed
+    # Create model with skip_weight_init=True to avoid calling reinit_weights in __init__
     import jax
     key = jax.random.PRNGKey(42)
-    model = Spatial(rho=5000, dx=0.5, key=key)
-    print("✓ Model initialized successfully")
+    model = Spatial(rho=5000, dx=0.5, key=key, skip_weight_init=True)
+    print("✓ Model initialized successfully (skipping weight init)")
     print(f"  - Network size: {model.N_e} excitatory, {model.N_i} inhibitory")
+    
+    # Now call training-compatible weight initialization
+    print("\nCalling reinit_weights_training...")
+    model.reinit_weights_training()
+    print("✓ reinit_weights_training succeeded")
+    
+    # Manually set training mode on components
+    training_mode = bm.TrainingMode() if hasattr(bm, "TrainingMode") else bm.training_mode
+    model._mode = training_mode
+    model.E._mode = training_mode
+    model.I._mode = training_mode
+    for proj_name in ("E2E", "E2I", "I2E", "I2I", "ext2E", "ext2I"):
+        getattr(model, proj_name)._mode = training_mode
+    print("✓ Manually set training mode on all components")
+    
+    print("\nSUCCESS: Training mode initialization works with skip_weight_init + reinit_weights_training!")
+    
 except Exception as e:
-    print(f"✗ Failed to initialize model in training mode: {e}")
-    print("\nTrying new reinit_weights_training method...")
-    try:
-        # Initialize model without calling reinit_weights by setting g_max to non-zero
-        # This is a workaround - we need to modify the model to skip reinit_weights in __init__
-        # For now, let's try a different approach: initialize in default mode, then switch to training mode
-        import jax
-        key = jax.random.PRNGKey(42)
-        model = Spatial(rho=5000, dx=0.5, key=key)
-        print("✓ Model initialized successfully in default mode")
-        print(f"  - Network size: {model.N_e} excitatory, {model.N_i} inhibitory")
-        
-        # Now try to reinitialize weights using the training-compatible method
-        print("\nTesting reinit_weights_training method...")
-        model.reinit_weights_training()
-        print("✓ reinit_weights_training succeeded")
-        
-        # Now set training mode
-        training_mode = bm.TrainingMode() if hasattr(bm, "TrainingMode") else bm.training_mode
-        model._mode = training_mode
-        model.E._mode = training_mode
-        model.I._mode = training_mode
-        for proj_name in ("E2E", "E2I", "I2E", "I2I", "ext2E", "ext2I"):
-            getattr(model, proj_name)._mode = training_mode
-        print("✓ Manually set training mode on all components")
-        
-        print("\nSUCCESS: Training mode initialization works with reinit_weights_training!")
-        
-    except Exception as e2:
-        print(f"✗ reinit_weights_training approach failed: {e2}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
+    print(f"✗ Training mode initialization failed: {e}")
+    import traceback
+    traceback.print_exc()
+    sys.exit(1)
 
 print("\n" + "=" * 60)
 print("TEST 2: Check Trainable Variables")
