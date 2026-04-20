@@ -12,20 +12,15 @@ This script tests:
 import sys
 import os
 
-# Add src directory to path
+# Add current directory to path to allow 'from src...' imports
 current_dir = os.path.dirname(os.path.abspath(__file__))
-src_dir = os.path.join(current_dir, 'src')
-sys.path.insert(0, src_dir)
+sys.path.insert(0, current_dir)
 
 import brainpy as bp
 import brainpy.math as bm
 
-# Direct import from file
-import importlib.util
-spatial_path = os.path.join(src_dir, 'models', 'Spatial.py')
-spec = importlib.util.spec_from_file_location("Spatial", spatial_path)
-Spatial = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(Spatial)
+# Import using same style as run_simulation.py
+from src.models.Spatial import Spatial
 
 print("=" * 60)
 print("TEST 1: Model Initialization in Training Mode")
