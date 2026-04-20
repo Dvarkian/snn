@@ -472,6 +472,51 @@ class Spatial(bp.Network):
         )
         self.reset_state()  ## or bp.reset_state(self)??
 
+    def reinit_weights_training(self, delta=None, J_e=None):
+        """
+        Training-compatible version of reinit_weights that uses .value setter
+        for weight assignment, which is compatible with BrainPy training mode.
+        
+        This method should be used instead of reinit_weights when initializing
+        the model in training mode.
+        """
+        if delta is not None:
+            self.delta = delta
+        if J_e is not None:
+            self.J_ee = J_e[0]
+            self.J_ei = J_e[1]
+
+        self.J_ie = self.J_ee * self.delta
+        self.J_ii = self.J_ei * self.delta
+        self.key, subkey = jax.random.split(self.key)
+        self.E2E.proj.comm.weight.value = correlate_weights(
+            self.E2E.proj,
+            self.J_ee,
+            self.N_e,
+            subkey,
+        )
+        self.key, subkey = jax.random.split(self.key)
+        self.E2I.proj.comm.weight.value = correlate_weights(
+            self.E2I.proj, self.J_ei, self.N_i, subkey
+        )
+        self.key, subkey = jax.random.split(self.key)
+        self.I2E.proj.comm.weight.value = correlate_weights(
+            self.I2E.proj, self.J_ie, self.N_e, subkey
+        )
+        self.key, subkey = jax.random.split(self.key)
+        self.I2I.proj.comm.weight.value = correlate_weights(
+            self.I2I.proj, self.J_ii, self.N_i, subkey
+        )
+        self.key, subkey = jax.random.split(self.key)
+        self.ext2E.proj.comm.weight.value = correlate_weights(
+            self.ext2E.proj, self.J_ee, self.N_e, subkey
+        )
+        self.key, subkey = jax.random.split(self.key)
+        self.ext2I.proj.comm.weight.value = correlate_weights(
+            self.ext2I.proj, self.J_ei, self.N_i, subkey
+        )
+        self.reset_state()
+
     def reinit_nu(self, nu):
         self.nu = nu
         self.ext.freqs = nu
