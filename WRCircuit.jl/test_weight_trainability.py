@@ -10,14 +10,20 @@ This script tests:
 """
 
 import sys
-sys.path.insert(0, '/home/murray/Development/SNN/Project/snn/WRCircuit.jl/src')
+import os
+
+# Add src directory to path
+current_dir = os.path.dirname(os.path.abspath(__file__))
+src_dir = os.path.join(current_dir, 'src')
+sys.path.insert(0, src_dir)
 
 import brainpy as bp
 import brainpy.math as bm
 
 # Direct import from file
 import importlib.util
-spec = importlib.util.spec_from_file_location("Spatial", "/home/murray/Development/SNN/Project/snn/WRCircuit.jl/src/models/Spatial.py")
+spatial_path = os.path.join(src_dir, 'models', 'Spatial.py')
+spec = importlib.util.spec_from_file_location("Spatial", spatial_path)
 Spatial = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(Spatial)
 
