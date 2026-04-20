@@ -14,7 +14,12 @@ sys.path.insert(0, '/home/murray/Development/SNN/Project/snn/WRCircuit.jl/src')
 
 import brainpy as bp
 import brainpy.math as bm
-from models.Spatial import Spatial
+
+# Direct import from file
+import importlib.util
+spec = importlib.util.spec_from_file_location("Spatial", "/home/murray/Development/SNN/Project/snn/WRCircuit.jl/src/models/Spatial.py")
+Spatial = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(Spatial)
 
 print("=" * 60)
 print("TEST 1: Model Initialization in Training Mode")
