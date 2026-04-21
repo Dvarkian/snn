@@ -1,6 +1,5 @@
 import brainpy as bp
 import brainpy.math as bm
-from brainpy.connect import TwoEndConnector
 import numpy as np
 import matplotlib.pyplot as plt
 from itertools import product
@@ -13,17 +12,14 @@ from jax import lax
 import copy
 import os
 
-from typing import Union, Callable, Optional, Sequence, Any
-from functools import partial
+from brainpy import share
+from brainpy.connect import TwoEndConnector
+from brainpy.types import Shape, ArrayType
 from brainpy.check import is_initializer
 from brainpy import odeint, sdeint, JointEq
-from brainpy.types import Shape, ArrayType
-
-# Replacement for brainpy._src.connect.base.get_idx_type
-def get_idx_type():
-    """Get the appropriate integer type for indices."""
-    # Use int32 for compatibility with JAX/BrainPy
-    return jnp.int32
+from brainpy._src.connect.base import get_idx_type
+from typing import Union, Callable, Optional, Sequence, Any
+from functools import partial
 
 
 def pytree_to_numpy(pytree):
@@ -116,6 +112,30 @@ def correlate_weights(proj, J, N, key):
     new_ws = w_means + randvals * w_scales
 
     return new_ws
+
+
+def correlate_weights_dense(proj, J, pre_size, post_size, key):
+    """Dense version of correlate_weights for dense matrices.
+    Maintains biological scaling ~ J / sqrt(k) where k is expected indegree.
+    """
+    # Flatten sizes if they are tuples
+    pre_size_flat = int(np.prod(pre_size))
+    post_size_flat = int(np.prod(post_size))
+    
+    # For All2All connectivity, each neuron connects to all others
+    # Expected indegree = post_size for each presynaptic neuron
+    k_expected = post_size_flat
+    
+    # Scale factor: J / sqrt(k)
+    w_mean = J / jnp.sqrt(k_expected)
+    w_scale = 0.05 * w_mean
+    
+    # Initialize dense weights with normal distribution
+    # Shape: (post_size_flat, pre_size_flat) for Dense layer
+    weights = jax.random.normal(key, shape=(post_size_flat, pre_size_flat))
+    weights = w_mean + weights * w_scale
+    
+    return weights
 
 
 class CSRConn(TwoEndConnector):

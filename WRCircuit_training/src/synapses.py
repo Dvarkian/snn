@@ -3,7 +3,7 @@ import brainpy.math as bm
 from brainpy.connect import TwoEndConnector, All2All, One2One
 from brainpy.synapses import TwoEndConn, SynOut, SynSTP
 from brainpy.initialize import Initializer
-# from brainpy._src.initialize.base import _InterLayerInitializer  # Private module, not available
+from brainpy._src.initialize.base import _InterLayerInitializer
 from brainpy.synouts import CUBA
 from typing import Union, Dict, Callable, Optional, Tuple
 import numpy as np
@@ -49,6 +49,41 @@ def maybe_initializer(x, exclude=["rng"]):
         return x
 
 
+class ScaledInitializer(_InterLayerInitializer):
+    """A wrapper that scales the output of any initializer by a constant factor.
+
+    Parameters
+    ----------
+    initializer : callable
+        The base initializer to wrap.
+    scale_factor : float
+        The constant factor by which to scale the initializer's output.
+    """
+
+    def __init__(self, initializer, scale_factor):
+        super(ScaledInitializer, self).__init__()
+        self.initializer = initializer
+        self.scale_factor = scale_factor
+
+    def __call__(self, shape, dtype=None):
+        # Call the wrapped initializer to get the initial weights.
+        if callable(self.initializer):
+            weights = self.initializer(shape, dtype=dtype)
+        elif isinstance(self.initializer, (int, float)):
+            # Create an array filled with the constant initializer value.
+            weights = jnp.full(shape, self.initializer, dtype=dtype or jnp.float32)
+        else:
+            raise ValueError("Initializer must be callable or a constant float value.")
+        # Scale the weights by the constant factor.
+        return self.scale_factor * weights
+
+    def __repr__(self):
+        return (
+            f"{self.__class__.__name__}(initializer={self.initializer}, "
+            f"scale_factor={self.scale_factor})"
+        )
+
+
 class Synapse(bp.Projection):
     def __init__(
         self,
@@ -63,7 +98,6 @@ class Synapse(bp.Projection):
         alpha: Union[float, ArrayType, Initializer, Callable] = 1.0,
         name: Optional[str] = None,
         mode: Optional[bm.Mode] = None,
-        weight: Union[ArrayType, None] = None,  # New parameter for training mode
     ):
         self.delay = delay
         self.g_max = g_max
@@ -78,16 +112,6 @@ class Synapse(bp.Projection):
         #     initializer=g_max, scale_factor=1.0 / (tau_d - tau_r)
         # )
         # A = 1/ (tau_d - tau_r)  # Setting A to this scales the integral of the conductance change to g_max. The default A means g_max is the peak conductance change.
-        
-        # For training mode, we need to initialize CSRLinear with the correct weight shape
-        # If weight is provided, we create a custom initializer that returns the weight array
-        if weight is not None:
-            def weight_initializer(shape, dtype=None):
-                return bm.asarray(weight)
-            initial_weight = weight_initializer
-        else:
-            initial_weight = g_max
-            
         self.proj = bp.dyn.FullProjAlignPreSDMg(
             pre=pre,
             delay=self.delay,
@@ -105,9 +129,8 @@ class Synapse(bp.Projection):
             # A=A),
             comm=bp.dnn.CSRLinear(
                 conn=conn(pre.size, post.size),
-                # weight=1.0,
-                weight=initial_weight,  # Use provided weight initializer or g_max
-            ),  ### IMPORTANT DON"T USE EVENTCSRLINEAR MESSES WITH THE SYNAPSES. See https://github.com/brainpy/BrainPy/issues/654#issuecomment-2008556824
+                weight=g_max,
+            ),  # Using CSRLinear (original) - gradients worked in trainable_activity_bptt.py
             out=bp.dyn.COBA(E=V_rev),
             post=post,
         )
@@ -142,9 +165,10 @@ class DeltaSynapse(bp.Projection):
             pre=pre,
             post=post,
             delay=self.delay,
-            comm=bp.dnn.EventCSRLinear(
-                conn(pre_size=pre.size, post_size=post.size), g_max
-            ),
+            comm=bp.dnn.Dense(
+                num_in=int(np.prod(pre.size)),
+                num_out=int(np.prod(post.size)),
+            ),  # Using Dense instead of EventCSRLinear
         )
 
 

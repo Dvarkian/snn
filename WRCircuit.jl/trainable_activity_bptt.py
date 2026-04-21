@@ -38,16 +38,15 @@ _neurons.stop_gradient = jax.lax.stop_gradient
 
 class Config:
     def __init__(self):
-        self.rho = 6000 
+        self.rho = 6000
         self.dx = 0.5
         self.dt = 0.5
         self.duration = 400.0
         self.steps = int(self.duration / self.dt)
         self.lr = 2e-3
-        self.target_rate_exc = 0.025
-        self.target_rate_inh = 0.020
+        self.target_rate = 0.005  # 10 Hz (10 spikes/sec / 2000 steps/sec = 0.005)
         self.smooth_tau = 12.0
-        self.nu = 25.0
+        self.nu = 10.0  # Match stochastic drive to target rate
         self.ui_update_interval = 2
         self.dark_mode = True
         self.colors = {'exc': '#FF2E63', 'inh': '#08D9D6', 'bg': '#1A1A1D', 'text': '#EAEAEA'}
@@ -86,9 +85,9 @@ class DifferentiableSNN(bp.DynamicalSystem):
             self.smooth_e.value = self.alpha * self.smooth_e.value + (1 - self.alpha) * re
             self.smooth_i.value = self.alpha * self.smooth_i.value + (1 - self.alpha) * ri
             fit_loss = bm.square(self.smooth_e.value[0] - target_at_t[0]) + bm.square(self.smooth_i.value[0] - target_at_t[1])
-            silence_p = 2.0 * (bm.exp(-40.0 * re) + bm.exp(-40.0 * ri))
-            reg = 5.0 * (bm.maximum(0.0, re - 0.15)**2 + bm.maximum(0.0, ri - 0.15)**2)
-            return (se, si, self.smooth_e.value[0], self.smooth_i.value[0], fit_loss + silence_p + reg)
+            # Silence penalty to prevent network from suppressing all activity
+            silence_p = 1.0 * (bm.exp(-40.0 * re) + bm.exp(-40.0 * ri))
+            return (se, si, self.smooth_e.value[0], self.smooth_i.value[0], fit_loss + silence_p)
         return bm.for_loop(step, (indices, target_rates), progress_bar=False)
 
 class SNNTrainer(bp.DynamicalSystem):
@@ -105,11 +104,11 @@ class SNNTrainer(bp.DynamicalSystem):
         
         self.diff_snn = DifferentiableSNN(cfg, self.spatial)
         self.opt = bp.optim.Adam(lr=cfg.lr, train_vars=self.diff_snn.trainable_vars)
-        
+
+        # Constant 50 Hz target for both populations
         ts = np.linspace(0, cfg.duration, cfg.steps)
-        target_e = cfg.target_rate_exc * (1.0 + 0.6 * np.sin(2 * np.pi * 0.005 * ts))
-        target_i = cfg.target_rate_inh * (1.0 + 0.4 * np.cos(2 * np.pi * 0.005 * ts))
-        self.target_rates = bm.asarray(np.stack([target_e, target_i], axis=1))
+        target_constant = np.full_like(ts, cfg.target_rate)
+        self.target_rates = bm.asarray(np.stack([target_constant, target_constant], axis=1))
         self.loss_history = []; self.last_rollout = None; self.epoch = 0
 
     def train_step(self):
@@ -149,8 +148,9 @@ class UI:
             ax.scatter(t, np.ones_like(t)*i, s=2, color=self.cfg.colors['exc'])
         ax.set_title(f"Raster Plot - Epoch {self.trainer.epoch}")
         ax = self.axs[1, 0]; ax.clear()
-        ax.plot(ts, targets[:, 0], '--', alpha=0.15); ax.plot(ts, r_e, color=self.cfg.colors['exc'], lw=2); ax.plot(ts, r_i, color=self.cfg.colors['inh'], lw=2)
+        ax.plot(ts, targets[:, 0], '--', alpha=0.5, label='Target (10 Hz)'); ax.plot(ts, r_e, color=self.cfg.colors['exc'], lw=2, label='Excitatory'); ax.plot(ts, r_i, color=self.cfg.colors['inh'], lw=2, label='Inhibitory')
         ax.set_title("Target vs Observed Rates")
+        ax.legend()
         ax = self.axs[0, 1]; ax.clear(); ax.plot(self.trainer.loss_history, color='yellow'); ax.set_yscale('log'); ax.set_title("Training Loss")
         ax = self.axs[1, 1]; ax.clear()
         w_vals = [np.mean(np.abs(np.asarray(v))) for v in self.trainer.diff_snn.trainable_vars.values()]
@@ -160,7 +160,7 @@ class UI:
 
 def main():
     cfg = Config(); trainer = SNNTrainer(cfg); ui = UI(trainer)
-    print(f"SNN BPTT Active. stochastic Drive: Spatial.nu={cfg.nu}Hz")
+    print(f"SNN BPTT Active. Target: 10 Hz, Stochastic Drive: Spatial.nu={cfg.nu}Hz")
     try:
         while True:
             loss = trainer.run_epoch()

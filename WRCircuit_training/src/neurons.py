@@ -9,8 +9,8 @@ from abc import ABC, abstractmethod
 import jax
 import jax.numpy as jnp
 from jax import jit, vmap
-from jax.lax import stop_gradient
 import uuid
+from jax import lax
 
 import brainpy as bp
 import brainpy.math as bm
@@ -29,15 +29,9 @@ from brainpy import share
 from brainpy.types import Shape, ArrayType
 from brainpy.check import is_initializer
 from brainpy import odeint, sdeint, JointEq
+from brainpy._src.connect.base import get_idx_type
+from brainpy._src.dyn.utils import get_spk_type
 from typing import Union, Callable, Optional, Sequence, Any
-
-# Replacement for brainpy._src.dyn.utils.get_spk_type
-def get_spk_type(spk_type, mode):
-    """Get the spike type based on mode."""
-    if spk_type is not None:
-        return spk_type
-    # Default to bool for spiking neurons
-    return jnp.bool_
 from functools import partial
 
 from .positions import *
@@ -239,25 +233,12 @@ class FNSNeuron(GradNeuDyn):
         self.input = variable_(
             bm.zeros, self.varshape, batch_size
         )  # Track current inputs
-        # Add internal time counter for training mode
-        self._time_counter = bm.Variable(bm.asarray(0.0))
 
     def update(self, I_ext=None):
-        try:
-            t = share.load("t")
-        except KeyError:
-            t = None
-        try:
-            dt = share.load("dt")
-        except KeyError:
-            dt = bm.get_dt()
+        t = share.load("t")
+        dt = share.load("dt")
         if I_ext == None:
             I_ext = 0.0
-
-        # Use internal time counter if t is None (training mode)
-        if t is None:
-            t = self._time_counter
-            self._time_counter += dt
 
         I = self.sum_current_inputs(
             self.V, init=I_ext
@@ -274,7 +255,7 @@ class FNSNeuron(GradNeuDyn):
         # spike
         if isinstance(self.mode, bm.TrainingMode):
             spike = self.spk_fun(V - self.V_th)
-            spike_no_grad = stop_gradient(spike) if self.detach_spk else spike
+            spike_no_grad = lax.stop_gradient(spike) if self.detach_spk else spike
 
             if self.spk_reset == "soft":
                 V -= (self.V_th - self.V_rt) * spike_no_grad
@@ -283,16 +264,12 @@ class FNSNeuron(GradNeuDyn):
             else:
                 raise ValueError
 
-            t_last_spike = stop_gradient(
+            t_last_spike = lax.stop_gradient(
                 bm.where(spike_no_grad > 0.0, t, self.t_last_spike.value)
             )
-            refractory = stop_gradient(
-                bm.logical_or(refractory, spike_no_grad > 0.0).value
+            refractory = lax.stop_gradient(
+                bm.where(spike_no_grad > 0.0, t, self.t_last_spike.value)
             )
-
-            # Update g_K upon spike
-            g_K += self.Delta_g_K * spike_no_grad
-
         else:
             spike = V >= self.V_th
             V = bm.where(spike, self.V_rt, V)

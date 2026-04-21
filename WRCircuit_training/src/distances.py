@@ -16,7 +16,6 @@ import os
 from typing import Union, Callable, Optional, Sequence, Any
 from functools import partial
 from .utils import *
-from .utils import get_idx_type  # Import our replacement function
 
 
 def euclidean_distance(pos1, pos2):

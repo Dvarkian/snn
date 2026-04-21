@@ -28,8 +28,8 @@ from brainpy import share
 from brainpy.types import Shape, ArrayType
 from brainpy.check import is_initializer
 from brainpy import odeint, sdeint, JointEq
-# from brainpy._src.connect.base import get_idx_type  # Private module, not available
-# from brainpy._src.dyn.utils import get_spk_type  # Private module, not available
+from brainpy._src.connect.base import get_idx_type
+from brainpy._src.dyn.utils import get_spk_type
 from typing import Union, Callable, Optional, Sequence, Any
 from functools import partial
 from ..utils import *

@@ -52,7 +52,7 @@ from brainpy import share
 from brainpy.types import Shape, ArrayType
 from brainpy.check import is_initializer
 from brainpy import odeint, sdeint, JointEq
-# from brainpy._src.connect.base import get_idx_type  # Private module, not available
+from brainpy._src.connect.base import get_idx_type
 from typing import Union, Callable, Optional, Sequence, Any
 from functools import partial
 from ..utils import *
@@ -152,7 +152,6 @@ class Spatial(bp.Network):
         method="exp_auto",
         key=None,
         copy_conn=False,  # Whether to copy connectivity from the provided WRCircuit
-        training_mode=False,  # If True, pre-compute weights for training compatibility
     ):
         super().__init__()
 
@@ -172,7 +171,6 @@ class Spatial(bp.Network):
 
         self.method = method
         self.kernel = kernel
-        self.training_mode = training_mode
 
         if key is None:
             # Add a warning here about non-reproducibility
@@ -341,7 +339,7 @@ class Spatial(bp.Network):
             self.key, subkey = jax.random.split(self.key)
             conn_exti = FixedProb(prob=p_ext, seed=subkey)
 
-        # Synapses - create normally
+        # Synapses
         self.key, subkey = jax.random.split(self.key)
         self.E2E = Synapse(
             pre=self.E,
@@ -349,13 +347,10 @@ class Spatial(bp.Network):
             delay=e_delay,
             conn=conn_ee,
             tau_d=tau_d_e,
-            tau_r=bp.init.Normal(
-                tau_r_e, 0.05 * tau_r_e, subkey
-            ),
-            g_max=0.0,
-            V_rev=V_rev_e,
+            tau_r=bp.init.Normal(0.5 * tau_d_e, 0.05 * tau_d_e),  # !!! CHECK
+            g_max=bp.init.Constant(0.0),
+            V_rev=0.0,
         )
-
         self.key, subkey = jax.random.split(self.key)
         self.E2I = Synapse(
             pre=self.E,
@@ -363,11 +358,10 @@ class Spatial(bp.Network):
             delay=e_delay,
             conn=conn_ei,
             tau_d=tau_d_e,
-            tau_r=bp.init.Normal(tau_r_e, 0.05 * tau_r_e, subkey),
-            g_max=0.0,
-            V_rev=V_rev_e,
+            tau_r=bp.init.Normal(0.5 * tau_d_e, 0.05 * tau_d_e),  # !!! CHECK
+            g_max=bp.init.Constant(0.0),
+            V_rev=0.0,
         )
-
         self.key, subkey = jax.random.split(self.key)
         self.I2E = Synapse(
             pre=self.I,
@@ -375,11 +369,10 @@ class Spatial(bp.Network):
             delay=i_delay,
             conn=conn_ie,
             tau_d=tau_d_i,
-            tau_r=bp.init.Normal(tau_r_i, 0.05 * tau_r_i, subkey),
-            g_max=0.0,
-            V_rev=V_rev_i,
+            tau_r=bp.init.Normal(0.5 * tau_d_i, 0.05 * tau_d_i),  # !!! CHECK
+            g_max=bp.init.Constant(0.0),
+            V_rev=-80.0,
         )
-
         self.key, subkey = jax.random.split(self.key)
         self.I2I = Synapse(
             pre=self.I,
@@ -387,9 +380,9 @@ class Spatial(bp.Network):
             delay=i_delay,
             conn=conn_ii,
             tau_d=tau_d_i,
-            tau_r=bp.init.Normal(tau_r_i, 0.05 * tau_r_i, subkey),
-            g_max=0.0,
-            V_rev=V_rev_i,
+            tau_r=bp.init.Normal(0.5 * tau_d_i, 0.05 * tau_d_i),  # !!! CHECK
+            g_max=bp.init.Constant(0.0),
+            V_rev=-80.0,
         )
 
         # External population
@@ -411,10 +404,9 @@ class Spatial(bp.Network):
             conn=conn_exte,
             delay=e_delay,
             tau_d=tau_d_e,
-            g_max=self.J_ee if not self.training_mode else 0.0,
+            g_max=bp.init.Constant(0.0),
             tau_r=bp.init.Normal(tau_r_e, 0.05 * tau_r_e, subkey),
             V_rev=V_rev_e,
-            weight=None if not self.training_mode else 0.0,
         )
         self.key, subkey = jax.random.split(self.key)
         self.ext2I = Synapse(
@@ -423,10 +415,9 @@ class Spatial(bp.Network):
             conn=conn_exti,
             delay=e_delay,
             tau_d=tau_d_e,
-            g_max=self.J_ei if not self.training_mode else 0.0,
+            g_max=bp.init.Constant(0.0),
             tau_r=bp.init.Normal(tau_r_e, 0.05 * tau_r_e, subkey),
             V_rev=V_rev_e,
-            weight=None if not self.training_mode else 0.0,
         )
 
         # define input variables given to E/I populations
@@ -435,55 +426,8 @@ class Spatial(bp.Network):
         self.E.add_inp_fun("", self.Ein)
         self.I.add_inp_fun("", self.Iin)
 
-        # Training-compatible weight initialization
-        if self.training_mode:
-            # Compute E2E weights and make trainable
-            self.key, subkey = jax.random.split(self.key)
-            w_ee = correlate_weights(
-                self.E2E.proj, self.J_ee, self.N_e, subkey
-            )
-            # Replace the weight Variable entirely with a TrainVar (store weights directly)
-            self.w_ee_trainable = bm.TrainVar(bm.asarray(w_ee))
-            # Replace the CSRLinear's weight variable with our TrainVar
-            self.E2E.proj.comm._weight = self.w_ee_trainable
-            
-            # Initialize other recurrent weights as TrainVar
-            self.key, subkey = jax.random.split(self.key)
-            w_ei = correlate_weights(
-                self.E2I.proj, self.J_ei, self.N_i, subkey
-            )
-            self.w_ei_trainable = bm.TrainVar(bm.asarray(w_ei))
-            self.E2I.proj.comm._weight = self.w_ei_trainable
-            
-            self.key, subkey = jax.random.split(self.key)
-            w_ie = correlate_weights(
-                self.I2E.proj, self.J_ie, self.N_e, subkey
-            )
-            self.w_ie_trainable = bm.TrainVar(bm.asarray(w_ie))
-            self.I2E.proj.comm._weight = self.w_ie_trainable
-            
-            self.key, subkey = jax.random.split(self.key)
-            w_ii = correlate_weights(
-                self.I2I.proj, self.J_ii, self.N_i, subkey
-            )
-            self.w_ii_trainable = bm.TrainVar(bm.asarray(w_ii))
-            self.I2I.proj.comm._weight = self.w_ii_trainable
-            
-            # External input weights remain as regular Variables (not trained)
-            self.key, subkey = jax.random.split(self.key)
-            w_exte = correlate_weights(
-                self.ext2E.proj, self.J_ee, self.N_e, subkey
-            )
-            self.ext2E.proj.comm._weight = bm.Variable(bm.asarray(w_exte))
-            
-            self.key, subkey = jax.random.split(self.key)
-            w_exti = correlate_weights(
-                self.ext2I.proj, self.J_ei, self.N_i, subkey
-            )
-            self.ext2I.proj.comm._weight = bm.Variable(bm.asarray(w_exti))
-        else:
-            # Standard weight initialization for simulation mode
-            self.reinit_weights(self.delta, (self.J_ee, self.J_ei))
+        # * Posthoc weight updates to maintain mean_weight = 1/sqrt(in-degree) per neuron
+        # Don't call reinit_weights in __init__ - will be called separately for training
 
     def reinit_weights(self, delta=None, J_e=None):
         if delta is not None:
@@ -495,38 +439,33 @@ class Spatial(bp.Network):
         self.J_ie = self.J_ee * self.delta
         self.J_ii = self.J_ei * self.delta
         self.key, subkey = jax.random.split(self.key)
-        w_ee = correlate_weights(
+        self.E2E.proj.comm.weight = correlate_weights(
             self.E2E.proj,
             self.J_ee,
             self.N_e,
-            subkey,
+            subkey,  # ? Need to pass N_ee to keep this function jittable.
         )
-        self.E2E.proj.comm._weight = bm.Variable(bm.asarray(w_ee))
         self.key, subkey = jax.random.split(self.key)
-        w_ei = correlate_weights(
+        self.E2I.proj.comm.weight = correlate_weights(
             self.E2I.proj, self.J_ei, self.N_i, subkey
         )
-        self.E2I.proj.comm._weight = bm.Variable(bm.asarray(w_ei))
         self.key, subkey = jax.random.split(self.key)
-        w_ie = correlate_weights(
+        self.I2E.proj.comm.weight = correlate_weights(
             self.I2E.proj, self.J_ie, self.N_e, subkey
         )
-        self.I2E.proj.comm._weight = bm.Variable(bm.asarray(w_ie))
         self.key, subkey = jax.random.split(self.key)
-        w_ii = correlate_weights(
+        self.I2I.proj.comm.weight = correlate_weights(
             self.I2I.proj, self.J_ii, self.N_i, subkey
         )
-        self.I2I.proj.comm._weight = bm.Variable(bm.asarray(w_ii))
         self.key, subkey = jax.random.split(self.key)
-        w_exte = correlate_weights(
+        self.ext2E.proj.comm.weight = correlate_weights(
             self.ext2E.proj, self.J_ee, self.N_e, subkey
         )
-        self.ext2E.proj.comm._weight = bm.Variable(bm.asarray(w_exte))
         self.key, subkey = jax.random.split(self.key)
-        w_exti = correlate_weights(
+        self.ext2I.proj.comm.weight = correlate_weights(
             self.ext2I.proj, self.J_ei, self.N_i, subkey
         )
-        self.ext2I.proj.comm._weight = bm.Variable(bm.asarray(w_exti))
+        # Don't call reset_state here - will be called separately
 
     def reinit_nu(self, nu):
         self.nu = nu
